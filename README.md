@@ -2,66 +2,208 @@
 
 > Experimental Opsle research. Claims are hypotheses until evidence supports them.
 
-## Problem
+## Thesis
 
-Tools often send models large volumes of successful-test noise, shell chatter, and repeated state that does not affect the next decision.
+Operational output should not become model-visible merely because a tool emitted
+it. Deterministic software can suppress repetitive success output while retaining
+decision evidence, provenance, measurements, and a safe path back to raw bytes.
 
-## Hypothesis
+The broader research question is: **How much context can an AI coding agent
+safely not see?** This repository does not yet answer it.
 
-Policy-driven reduction can remove substantial operational payload without lowering correctness when escalation and provenance remain available.
+## Prototype scope
 
-## Mechanism
+Version 0.2.0 is a dependency-free Node.js reference reducer for a documented
+flat TAP-compatible test-output subset. It:
 
-Apply allow rules, suppression, aggregation, escalation, deterministic reducers, and payload ceilings between raw tool output and the model; retain links to auditable raw artifacts.
+- reads caller-supplied stdout and stderr bytes plus process metadata;
+- derives test verdict and pass, fail, and skip counts;
+- retains every recognized failure header and failure-region line;
+- retains strict fatal, timeout, and abnormal-warning markers;
+- summarizes successful tests, structure, duration source lines, and explicit
+  informational notes;
+- retains ambiguous or malformed evidence and requires raw-evidence escalation;
+- emits canonical JSON with source/configuration hashes and payload measurements;
+- applies deterministic payload ceilings without silently truncating critical
+  evidence.
 
-## Why it matters
+It does not parse arbitrary logs, Git output, compiler output, database output,
+HTTP traces, or every test runner. It has no model, provider, network, database,
+daemon, worker, UI, or product integration. It is not a production security
+boundary.
 
-The Opsle thesis asks: **What if we stopped using intelligence for work that doesn’t require intelligence?** This project isolates one candidate boundary so it can be falsified and measured independently.
+## Requirements
 
-## Non-goals
+- Node.js 20 or newer
+- no package installation or network access
 
-Hiding failures, lossy summarization without provenance, or assuming every tool can use the same fail-open/fail-closed policy.
+## Input
 
-## Current maturity
+The CLI accepts one JSON object from stdin or `--input`. The input protocol is
+`opsle.context-firewall.test-run-input/v1`.
 
-**THEORY** under the [Opsle maturity model](https://github.com/opsle/research/blob/main/MATURITY.md).
+```json
+{
+  "protocol_version": "opsle.context-firewall.test-run-input/v1",
+  "operation_id": "op-public-example",
+  "source": {
+    "id": "synthetic-suite",
+    "run_id": "run-public-example",
+    "raw_evidence_ref": "artifact://public/run.tap"
+  },
+  "process": {
+    "exit_code": 1,
+    "duration_ms": 12.5,
+    "interrupted": false
+  },
+  "streams": [
+    {
+      "name": "stdout",
+      "encoding": "utf8",
+      "data": "TAP version 13\nnot ok 1 - adds\n  message: expected 2\n1..1\n# tests 1\n# pass 0\n# fail 1\n# skipped 0\n"
+    }
+  ]
+}
+```
 
-## Existing evidence
+Each stream is `stdout` or `stderr`; each may appear at most once. `encoding` is
+`utf8` or `base64`. Base64 permits exact non-UTF-8 source bytes to be hashed and
+reported without pretending they were classifiable text.
 
-Bounded context construction and redaction patterns demonstrate feasibility. The safe reduction frontier is not established.
+Run the example:
 
-## Evidence still missing
+```bash
+node ./bin/context-firewall.js reduce \
+  --input examples/test-run-input.json
+```
 
-Task-stratified correctness curves, reducer conformance suites, escalation policy, and adversarial omission testing.
+Read from stdin with a 4,096-byte ceiling:
 
-## Benchmark strategy
+```bash
+node ./bin/context-firewall.js reduce \
+  --max-bytes 4096
+```
 
-Correctness gates every comparison. Planned measures:
+## Output packet
 
-- correctness
-- input bytes/tokens
-- suppression ratio
-- escalation rate
-- missing-evidence defects
-- reducer latency
+The output protocol is
+`opsle.context-firewall.evidence-packet/v1`. Canonical JSON contains:
 
-See [BENCHMARK.md](BENCHMARK.md) for experiment rules. No benchmark numbers are claimed.
+- `decision_evidence`: `passed`, `failed`, or `indeterminate` status; a
+  `SUFFICIENT` or `NEEDS_RAW_EVIDENCE` disposition; reason codes; process state;
+  aggregates; failures; fatal errors; timeouts; warnings; and unclassified data;
+- `receipt.source`: caller-supplied source/run identity and per-stream byte
+  counts;
+- `receipt.reducer` and `receipt.configuration`: exact reducer, policy, ceiling,
+  and configuration hash;
+- `receipt.input_hash`: SHA-256 over framed stdout/stderr bytes;
+- `receipt.semantic_payload_hash`: SHA-256 over canonical decision evidence;
+- `receipt.measurements`: exact raw/reduced bytes and original, retained, and
+  suppressed event counts;
+- `receipt.retained` and `receipt.suppressed`: explicit evidence taxonomy and
+  counts;
+- `receipt.raw_evidence`: caller reference, escalation state, and the distinction
+  between context suppression and destruction/unavailability.
 
-## Relationship to other Opsle research
+The reducer never deletes raw evidence. A supplied raw reference is recorded as
+`CALLER_REFERENCE_SUPPLIED`; the reducer does not claim it verified the external
+artifact. Without a reference, preservation is `PRESERVATION_UNCONFIRMED` and
+the packet requires escalation.
 
-This project is part of [Opsle Research](https://github.com/opsle/research). Opsle Tasks is the future public name of the integrated reference system from which several ideas emerged. Its active development migration to the Opsle organization is intentionally deferred.
+`reduced_bytes` is the exact byte length of canonical stdout, including its final
+newline. Raw and reduced bytes are sufficient for a trajectory consumer to
+calculate visible fraction and reduction ratio without parsing human logs.
+Runtime latency is intentionally absent from the hashed packet because it is
+nondeterministic; callers may measure it outside the packet.
 
-## Relationship to future Opsle Tasks
+## Deterministic retention policy
 
-Future Opsle Tasks may consume this project through an adapter only after evidence supports integration. The active predecessor, Taslos Tasks, remains unchanged and has no dependency on this repository.
+Classification is strict and case-sensitive after ANSI is removed for parsing.
+Original retained text still includes ANSI bytes.
 
-## Installation status
+Priority is:
 
-No installable production package is justified yet. The repository is theory/specification-first.
+1. verdict and process exit/interruption state;
+2. fatal process/runner and timeout evidence;
+3. every failed test identity, header, and failure-region line;
+4. aggregate counts and supplied duration;
+5. strict `WARNING:` or `WARN:` markers;
+6. unclassified evidence;
+7. structure, explicit `# note:` lines, and repetitive successful tests.
 
-## Known limitations
+Recognized failure regions are never partially truncated into a supposedly
+sufficient packet. Under a ceiling, the reducer first replaces lower-priority
+warning or unclassified text with hashes/locations and requires raw evidence. If
+critical evidence still cannot fit, it emits a compact
+`NEEDS_RAW_EVIDENCE` packet with failure identities and omits details only while
+explicitly declaring the packet insufficient. If even that safe packet cannot
+fit, stdout remains empty and the CLI emits a machine-readable
+`PAYLOAD_CEILING_TOO_SMALL` error on stderr with exit code 2.
 
-Task-stratified correctness curves, reducer conformance suites, escalation policy, and adversarial omission testing.
+The ceiling applies to model-visible stdout. Error-channel bytes are operational
+control output and are not presented as a valid reduced packet.
+
+## Strict TAP subset and limits
+
+The parser recognizes:
+
+- `ok` and `not ok` records, optional numeric indexes, and `# SKIP`;
+- indented or adjacent lines following `not ok` until the next test, plan, or
+  aggregate as one failure region;
+- `# tests`, `# pass`, `# fail`, and `# skipped` aggregates;
+- `TAP version`, plans, subtest headers, YAML delimiters, `# duration_ms`, and
+  `# note:` as structural/informational lines;
+- strict `FATAL:`, `RUNNER CRASH:`, `UNCAUGHT:`, `TIMEOUT:`, `WARNING:`, and
+  `WARN:` markers outside failure regions.
+
+Unknown lines, TODO semantics, malformed UTF-8, contradictory aggregates,
+interruption, missing exit state, missing source/operation identity, and
+unexplained nonzero exits remain explicit and require raw evidence. Words such as
+PASS, FAIL, error, and warning are not classified by substring.
+
+This flat subset does not establish full TAP conformance or support arbitrary
+nested runner dialects. Small inputs commonly expand because the receipt has
+fixed provenance cost; reduction is expected only for sufficiently repetitive
+source payloads.
+
+## Verification
+
+Run all tests:
+
+```bash
+npm test
+```
+
+Run the deterministic synthetic corpus:
+
+```bash
+npm run conformance
+```
+
+The conformance result is canonical JSON over 30 public-safe fixtures spanning
+normal success, normal failure, multi-failure retention, process problems, byte
+and text edge cases, payload boundaries, and provenance gaps. It reports raw and
+reduced sizes, verdict preservation, escalation, and PASS/FAIL.
+
+These are implementation fixtures, not model experiments or benchmark results.
+They do not show that reduced context preserves agent correctness.
+
+## EXP-001
+
+This prototype resolves one prerequisite for planned EXP-001: an executable,
+deterministic reducer with synthetic conformance evidence. EXP-001 remains
+PLANNED. Frozen experimental task fixtures, a correctness oracle, an experiment
+harness, exact model/provider configurations, and randomized/blinded allocation
+remain separate work.
+
+## Maturity and limitations
+
+**PROTOTYPED** under the canonical Opsle lifecycle. The implementation and its
+boundary tests establish a runnable mechanism, not comparative correctness,
+safe-frontier evidence, benchmark readiness, provider evidence, or replication.
+
+See [THEORY.md](THEORY.md), [SPEC.md](SPEC.md), and
+[BENCHMARK.md](BENCHMARK.md).
 
 ## License
 

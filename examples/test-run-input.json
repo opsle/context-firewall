@@ -1,0 +1,21 @@
+{
+  "protocol_version": "opsle.context-firewall.test-run-input/v1",
+  "operation_id": "op-public-example",
+  "source": {
+    "id": "synthetic-suite",
+    "run_id": "run-public-example",
+    "raw_evidence_ref": "artifact://public/run.tap"
+  },
+  "process": {
+    "exit_code": 1,
+    "duration_ms": 12.5,
+    "interrupted": false
+  },
+  "streams": [
+    {
+      "name": "stdout",
+      "encoding": "utf8",
+      "data": "TAP version 13\nnot ok 1 - adds\n  message: expected 2\n  expected: 2\n  actual: 3\n1..1\n# tests 1\n# pass 0\n# fail 1\n# skipped 0\n# duration_ms 12.5\n"
+    }
+  ]
+}
