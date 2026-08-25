@@ -1,0 +1,309 @@
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import {
+  INPUT_PROTOCOL,
+  InputError,
+  PACKET_PROTOCOL,
+  POLICY_REVISION,
+  PayloadCeilingError,
+  REDUCER_VERSION,
+  canonicalJson,
+  reduceTestRun,
+  serializePacket,
+} from '../src/reducer.js';
+import { conformanceReport, corpus, executeFixture } from '../fixtures/corpus.js';
+
+const cliPath = fileURLToPath(new URL('../bin/context-firewall.js', import.meta.url));
+
+function fixture(name) {
+  const value = corpus.find((item) => item.name === name);
+  assert.ok(value, `missing fixture ${name}`);
+  return value;
+}
+
+test('rejects an unsupported input protocol', () => {
+  assert.throws(
+    () => reduceTestRun({ protocol_version: 'other', streams: [] }),
+    (error) => error instanceof InputError && error.code === 'INVALID_INPUT',
+  );
+});
+
+test('same input and configuration produce byte-identical output', () => {
+  const input = fixture('failure/stack-trace').input;
+  const first = serializePacket(reduceTestRun(input, { maxOutputBytes: 10_000 }));
+  const second = serializePacket(reduceTestRun(input, { maxOutputBytes: 10_000 }));
+  assert.deepEqual(first, second);
+});
+
+test('canonical output contains no generated time or random identity', () => {
+  const packet = reduceTestRun(fixture('normal/small-all-pass').input);
+  const output = serializePacket(packet).toString('utf8');
+  assert.equal(/timestamp|created_at|generated_at|random|uuid/i.test(output), false);
+  assert.equal(packet.operation_id, 'op-synthetic-001');
+});
+
+test('packet identifies exact protocol, reducer, policy, and configuration', () => {
+  const packet = reduceTestRun(fixture('normal/small-all-pass').input);
+  assert.equal(packet.protocol_version, PACKET_PROTOCOL);
+  assert.equal(packet.receipt.reducer.version, REDUCER_VERSION);
+  assert.equal(packet.receipt.configuration.policy_revision, POLICY_REVISION);
+  assert.match(packet.receipt.configuration.identity, /^sha256:[0-9a-f]{64}$/);
+});
+
+test('large all-pass output is substantially reduced with correct aggregates', () => {
+  const packet = reduceTestRun(fixture('normal/large-all-pass').input);
+  assert.deepEqual(packet.decision_evidence.counts, { passed: 1500, failed: 0, skipped: 0, total: 1500 });
+  assert.equal(packet.decision_evidence.status, 'passed');
+  assert.ok(packet.receipt.measurements.reduced_bytes < packet.receipt.measurements.original_bytes * 0.1);
+  assert.equal(packet.receipt.suppressed.categories.successful_test, 1500);
+});
+
+test('a failed test retains identity, message, assertion, and location', () => {
+  const packet = reduceTestRun(fixture('failure/one').input);
+  const [failure] = packet.decision_evidence.failures;
+  assert.equal(failure.identity, 'adds values');
+  assert.equal(failure.header.category, 'failed_test');
+  assert.deepEqual(failure.details.map((item) => item.category), [
+    'failure_message', 'assertion', 'assertion',
+  ]);
+  assert.equal(failure.details[0].text.includes('expected two'), true);
+});
+
+test('multiple failures remain independent and ordered', () => {
+  const packet = reduceTestRun(fixture('failure/several').input);
+  assert.deepEqual(packet.decision_evidence.failures.map((failure) => failure.identity), [
+    'first', 'second', 'third',
+  ]);
+  assert.equal(packet.decision_evidence.counts.failed, 3);
+});
+
+test('pass, fail, and skipped counts are aggregated correctly', () => {
+  const mixed = reduceTestRun(fixture('failure/mixed-pass-fail').input);
+  const skipped = reduceTestRun(fixture('normal/skipped-tests').input);
+  assert.deepEqual(mixed.decision_evidence.counts, { passed: 2, failed: 1, skipped: 0, total: 3 });
+  assert.deepEqual(skipped.decision_evidence.counts, { passed: 1, failed: 0, skipped: 2, total: 3 });
+});
+
+test('failure stack lines retain their classified evidence', () => {
+  const packet = reduceTestRun(fixture('failure/stack-trace').input);
+  const details = packet.decision_evidence.failures[0].details;
+  assert.equal(details.some((item) => item.category === 'stack_trace'), true);
+  assert.equal(details.some((item) => item.text.trim() === '---'), true);
+  assert.equal(details.some((item) => item.text.trim() === '...'), true);
+  assert.equal(details.some((item) => item.text.includes('public/test.js:4:5')), true);
+});
+
+test('stdout and stderr provenance are distinct and hashed together', () => {
+  const item = fixture('edge/mixed-stdout-stderr');
+  const packet = reduceTestRun(item.input);
+  assert.deepEqual(packet.receipt.source.streams.map((stream) => stream.name), ['stdout', 'stderr']);
+  assert.match(packet.receipt.input_hash, /^sha256:[0-9a-f]{64}$/);
+  const changed = structuredClone(item.input);
+  changed.streams[1].data += 'WARNING: another\n';
+  assert.notEqual(reduceTestRun(changed).receipt.input_hash, packet.receipt.input_hash);
+});
+
+test('ANSI is ignored for classification but retained in evidence bytes', () => {
+  const packet = reduceTestRun(fixture('edge/ansi').input);
+  assert.equal(packet.decision_evidence.failures[0].identity, 'colored failure');
+  assert.equal(packet.decision_evidence.failures[0].details[0].text.includes('\u001b[31m'), true);
+});
+
+test('superficial PASS, FAIL, error, and warning words do not become verdicts', () => {
+  const packet = reduceTestRun(fixture('edge/superficial-pass-fail').input);
+  assert.equal(packet.decision_evidence.status, 'passed');
+  assert.equal(packet.decision_evidence.failures.length, 0);
+  assert.equal(packet.decision_evidence.warnings.length, 0);
+});
+
+test('runner crash and timeout evidence are explicit', () => {
+  const crash = reduceTestRun(fixture('process/runner-crash').input);
+  const timeout = reduceTestRun(fixture('process/timeout').input);
+  assert.equal(crash.decision_evidence.fatal_errors.length, 1);
+  assert.equal(crash.decision_evidence.process.exit_code, 2);
+  assert.equal(timeout.decision_evidence.timeouts.length, 1);
+  assert.equal(timeout.decision_evidence.process.exit_code, 124);
+});
+
+test('unexplained nonzero exit requires raw evidence', () => {
+  const packet = reduceTestRun(fixture('process/nonzero-unrecognized').input);
+  assert.equal(packet.decision_evidence.status, 'failed');
+  assert.equal(packet.decision_evidence.disposition, 'NEEDS_RAW_EVIDENCE');
+  assert.ok(packet.decision_evidence.reason_codes.includes('NONZERO_EXIT_WITHOUT_RECOGNIZED_FAILURE'));
+});
+
+test('interrupted output retains recognized evidence and escalates', () => {
+  const packet = reduceTestRun(fixture('process/interrupted-truncated').input);
+  assert.equal(packet.decision_evidence.failures[0].details[0].text.includes('cut off'), true);
+  assert.ok(packet.decision_evidence.reason_codes.includes('INTERRUPTED_OUTPUT'));
+  assert.equal(packet.receipt.reduction_complete, false);
+});
+
+test('malformed and ambiguous text cannot become false certainty', () => {
+  const packet = reduceTestRun(fixture('edge/malformed-output').input);
+  assert.equal(packet.decision_evidence.status, 'indeterminate');
+  assert.equal(packet.decision_evidence.disposition, 'NEEDS_RAW_EVIDENCE');
+  assert.equal(packet.receipt.unclassified_evidence_present, true);
+  assert.equal(packet.decision_evidence.unclassified_evidence.length, 2);
+});
+
+test('contradictory TAP aggregates require raw evidence', () => {
+  const input = structuredClone(fixture('normal/small-all-pass').input);
+  input.streams[0].data = input.streams[0].data.replace('# pass 2', '# pass 1');
+  const packet = reduceTestRun(input);
+  assert.equal(packet.decision_evidence.status, 'indeterminate');
+  assert.ok(packet.decision_evidence.reason_codes.includes('AGGREGATE_CONTRADICTION'));
+  assert.equal(packet.decision_evidence.disposition, 'NEEDS_RAW_EVIDENCE');
+});
+
+test('invalid UTF-8 is hash-addressed and escalated, never dropped', () => {
+  const input = structuredClone(fixture('normal/small-all-pass').input);
+  input.streams = [{ name: 'stdout', encoding: 'base64', data: Buffer.from([0xff, 0xfe]).toString('base64') }];
+  const packet = reduceTestRun(input);
+  assert.equal(packet.decision_evidence.status, 'indeterminate');
+  assert.ok(packet.decision_evidence.reason_codes.includes('MALFORMED_UTF8'));
+  assert.equal(packet.decision_evidence.unclassified_evidence[0].byte_count, undefined);
+  assert.match(packet.decision_evidence.unclassified_evidence[0].text, /non-UTF-8 2 bytes/);
+});
+
+test('missing raw reference is distinct from reducer destruction', () => {
+  const packet = reduceTestRun(fixture('provenance/raw-reference-absent').input);
+  assert.equal(packet.decision_evidence.disposition, 'NEEDS_RAW_EVIDENCE');
+  assert.equal(packet.receipt.raw_evidence.escalation_available, false);
+  assert.equal(packet.receipt.raw_evidence.source_evidence_disposition, 'PRESERVATION_UNCONFIRMED');
+  assert.equal(packet.receipt.raw_evidence.destroyed_by_reducer, false);
+});
+
+test('missing source identity is explicit and indeterminate', () => {
+  const packet = reduceTestRun(fixture('provenance/source-missing').input);
+  assert.equal(packet.receipt.source.id, null);
+  assert.ok(packet.decision_evidence.reason_codes.includes('SOURCE_IDENTITY_MISSING'));
+  assert.equal(packet.decision_evidence.status, 'indeterminate');
+});
+
+test('missing operation and exit identities fail closed', () => {
+  const input = structuredClone(fixture('normal/small-all-pass').input);
+  delete input.operation_id;
+  input.process.exit_code = null;
+  const packet = reduceTestRun(input);
+  assert.equal(packet.decision_evidence.status, 'indeterminate');
+  assert.ok(packet.decision_evidence.reason_codes.includes('OPERATION_ID_MISSING'));
+  assert.ok(packet.decision_evidence.reason_codes.includes('EXIT_STATUS_MISSING'));
+});
+
+test('an exact payload boundary is honored byte for byte', () => {
+  const result = executeFixture(fixture('payload/exact-boundary'));
+  assert.equal(result.pass, true);
+  assert.equal(serializePacket(result.packet).length, result.options.maxOutputBytes);
+  assert.equal(result.packet.receipt.payload_limit.affected, false);
+});
+
+test('payload pressure never silently truncates critical evidence', () => {
+  const item = fixture('payload/critical-too-large');
+  const packet = reduceTestRun(item.input, item.options);
+  const output = serializePacket(packet);
+  assert.ok(output.length <= item.options.maxOutputBytes);
+  assert.equal(packet.decision_evidence.disposition, 'NEEDS_RAW_EVIDENCE');
+  assert.ok(packet.decision_evidence.reason_codes.includes('PAYLOAD_LIMIT_CRITICAL_EVIDENCE_EXCEEDED'));
+  assert.equal(packet.decision_evidence.failures[0].identity, 'oversized-critical');
+  assert.equal('details' in packet.decision_evidence.failures[0], false);
+  assert.equal(packet.receipt.payload_limit.affected, true);
+});
+
+test('payload priority replaces warning text with an addressable reference first', () => {
+  const input = structuredClone(fixture('normal/small-all-pass').input);
+  input.streams[0].data += `WARNING: ${'bounded-warning'.repeat(600)}\n`;
+  const packet = reduceTestRun(input, { maxOutputBytes: 3_000 });
+  assert.equal(packet.decision_evidence.status, 'passed');
+  assert.equal(packet.decision_evidence.disposition, 'NEEDS_RAW_EVIDENCE');
+  assert.ok(packet.decision_evidence.reason_codes.includes('PAYLOAD_LIMIT_OMITTED_NONCRITICAL_TEXT'));
+  assert.equal(packet.decision_evidence.warnings.length, 1);
+  assert.equal('text' in packet.decision_evidence.warnings[0], false);
+  assert.ok(packet.decision_evidence.warnings[0].byte_count > 3_000);
+  assert.ok(serializePacket(packet).length <= 3_000);
+});
+
+test('a ceiling below the safe packet size fails with machine details and no packet', () => {
+  const item = fixture('payload/safe-packet-impossible');
+  assert.throws(
+    () => reduceTestRun(item.input, item.options),
+    (error) => error instanceof PayloadCeilingError
+      && error.details.disposition === 'NEEDS_RAW_EVIDENCE'
+      && error.details.minimum_safe_packet_bytes > item.options.maxOutputBytes,
+  );
+});
+
+test('original and reduced byte and event measurements are exact', () => {
+  const input = fixture('normal/small-all-pass').input;
+  const packet = reduceTestRun(input);
+  const output = serializePacket(packet);
+  const expectedInputBytes = input.streams.reduce((sum, stream) => sum + Buffer.byteLength(stream.data), 0);
+  assert.equal(packet.receipt.measurements.original_bytes, expectedInputBytes);
+  assert.equal(packet.receipt.measurements.reduced_bytes, output.length);
+  assert.equal(
+    packet.receipt.measurements.retained_evidence_count + packet.receipt.measurements.suppressed_evidence_count,
+    packet.receipt.measurements.original_event_count,
+  );
+});
+
+test('duration is caller-supplied semantic evidence and no runtime latency is hashed', () => {
+  const packet = reduceTestRun(fixture('normal/small-all-pass').input);
+  assert.equal(packet.decision_evidence.process.duration_ms, 12.5);
+  assert.equal('processing_latency_ms' in packet.receipt.measurements, false);
+});
+
+test('missing final newline has an exact event count', () => {
+  const item = fixture('edge/missing-final-newline');
+  const packet = reduceTestRun(item.input);
+  assert.equal(packet.receipt.measurements.original_event_count, item.input.streams[0].data.split('\n').length);
+});
+
+test('CLI reads JSON from stdin and emits the canonical packet', () => {
+  const input = fixture('normal/small-all-pass').input;
+  const result = spawnSync(process.execPath, [cliPath, 'reduce'], {
+    encoding: 'utf8',
+    input: JSON.stringify(input),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const expected = serializePacket(reduceTestRun(input)).toString('utf8');
+  assert.equal(result.stdout, expected);
+});
+
+test('CLI reports malformed JSON as a machine-readable error', () => {
+  const result = spawnSync(process.execPath, [cliPath, 'reduce'], {
+    encoding: 'utf8',
+    input: '{broken',
+  });
+  assert.equal(result.status, 2);
+  assert.deepEqual(JSON.parse(result.stderr), {
+    code: 'INVALID_INPUT',
+    message: 'input must be valid JSON',
+  });
+  assert.equal(result.stdout, '');
+});
+
+test('CLI keeps an impossible-ceiling error off model-visible stdout', () => {
+  const item = fixture('payload/safe-packet-impossible');
+  const result = spawnSync(process.execPath, [cliPath, 'reduce', '--max-bytes', '64'], {
+    encoding: 'utf8',
+    input: JSON.stringify(item.input),
+  });
+  assert.equal(result.status, 2);
+  assert.equal(result.stdout, '');
+  const error = JSON.parse(result.stderr);
+  assert.equal(error.code, 'PAYLOAD_CEILING_TOO_SMALL');
+  assert.equal(error.disposition, 'NEEDS_RAW_EVIDENCE');
+});
+
+test('all 30 synthetic fixtures conform', () => {
+  const report = conformanceReport();
+  assert.equal(report.fixture_count, 30);
+  assert.equal(report.conformance, 'PASS');
+  assert.equal(report.fixtures.every((item) => item.conformance === 'PASS'), true);
+});
+
+test('conformance output is deterministic', () => {
+  assert.equal(canonicalJson(conformanceReport()), canonicalJson(conformanceReport()));
+});

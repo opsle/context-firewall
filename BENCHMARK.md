@@ -33,3 +33,15 @@ Record model, provider, model version, reasoning effort, tool versions, fixture,
 ## Result policy
 
 Retain positive, negative, null, and failed experiments. Update maturity only when the actual stated hypothesis has reproducible evidence.
+
+## Prototype conformance is not EXP-001
+
+`npm run conformance` executes synthetic parser/reducer boundary fixtures. Its
+byte measurements demonstrate implementation behavior only. They are not model
+correctness, a baseline/arm comparison, a frozen experimental dataset, or a
+provider run, and must not be registered as EXP-001 results.
+
+Before EXP-001 can run, publish immutable task fixtures and hashes, a correctness
+oracle, a harness with raw/reduced arms, exact model/provider configuration, and
+randomized or blinded task allocation. Correctness must gate every efficiency
+comparison.

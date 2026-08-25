@@ -1,0 +1,16 @@
+{
+  "name": "@opsle/context-firewall",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "context-firewall": "./bin/context-firewall.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "conformance": "node ./bin/context-firewall.js conformance"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
