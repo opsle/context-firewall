@@ -1,29 +1,36 @@
 #!/usr/bin/env node
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import process from 'node:process';
 import { conformanceReport } from '../fixtures/corpus.js';
 import {
   InputError,
   PayloadCeilingError,
   canonicalJson,
-  reduceTestRun,
+  reduceWithValueReceipt,
   serializePacket,
 } from '../src/reducer.js';
+import { formatContextFirewallIndicator } from '../src/value-receipt.js';
 
 function usage() {
-  return 'usage: context-firewall reduce [--input PATH|-] [--max-bytes N]\n       context-firewall conformance\n';
+  return 'usage: context-firewall reduce [--input PATH|-] [--max-bytes N] [--mechanism-revision REV] [--value-receipt PATH]\n       context-firewall conformance\n';
 }
 
 function parseReduceArgs(args) {
   let input = '-';
   let maxOutputBytes = null;
+  let mechanismRevision = null;
+  let valueReceiptPath = null;
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === '--input' && args[index + 1]) input = args[++index];
     else if (args[index] === '--max-bytes' && args[index + 1]) {
       maxOutputBytes = Number(args[++index]);
+    } else if (args[index] === '--mechanism-revision' && args[index + 1]) {
+      mechanismRevision = args[++index];
+    } else if (args[index] === '--value-receipt' && args[index + 1]) {
+      valueReceiptPath = args[++index];
     } else throw new InputError(`unknown or incomplete argument: ${args[index]}`);
   }
-  return { input, maxOutputBytes };
+  return { input, maxOutputBytes, mechanismRevision, valueReceiptPath };
 }
 
 async function readInput(path) {
@@ -55,8 +62,15 @@ async function main() {
   } catch {
     throw new InputError('input must be valid JSON');
   }
-  const packet = reduceTestRun(input, { maxOutputBytes: options.maxOutputBytes });
+  const { packet, valueReceipt } = reduceWithValueReceipt(input, {
+    maxOutputBytes: options.maxOutputBytes,
+    mechanismRevision: options.mechanismRevision,
+  });
+  if (options.valueReceiptPath) {
+    await writeFile(options.valueReceiptPath, `${canonicalJson(valueReceipt)}\n`, 'utf8');
+  }
   process.stdout.write(serializePacket(packet));
+  process.stderr.write(`${formatContextFirewallIndicator(valueReceipt)}\n`);
 }
 
 main().catch((error) => {

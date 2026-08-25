@@ -13,7 +13,7 @@ safely not see?** This repository does not yet answer it.
 
 ## Prototype scope
 
-Version 0.2.0 is a dependency-free Node.js reference reducer for a documented
+Version 0.3.0 is a dependency-free Node.js reference reducer for a documented
 flat TAP-compatible test-output subset. It:
 
 - reads caller-supplied stdout and stderr bytes plus process metadata;
@@ -24,6 +24,9 @@ flat TAP-compatible test-output subset. It:
   informational notes;
 - retains ambiguous or malformed evidence and requires raw-evidence escalation;
 - emits canonical JSON with source/configuration hashes and payload measurements;
+- derives a sibling `opsle.value-receipt.v1` without adding it to model-visible
+  stdout;
+- emits one named operator completion indicator on stderr;
 - applies deterministic payload ceilings without silently truncating critical
   evidence.
 
@@ -115,6 +118,40 @@ newline. Raw and reduced bytes are sufficient for a trajectory consumer to
 calculate visible fraction and reduction ratio without parsing human logs.
 Runtime latency is intentionally absent from the hashed packet because it is
 nondeterministic; callers may measure it outside the packet.
+
+## Visible Value receipt and operator channel
+
+`reduceWithValueReceipt(input, options)` returns `{ packet, valueReceipt }` while
+`reduceTestRun(input, options)` remains packet-only. The value receipt uses
+`opsle.value-receipt.v1` and exposes raw/model-visible bytes, signed initially
+avoided bytes, an exact rational reduction ratio, original/retained/suppressed/
+ambiguous event counts, payload ceiling, escalation, and raw-locator state.
+Byte evidence makes no token, cost, latency, correctness, or causal claim.
+
+The CLI always writes only the compact canonical evidence packet to stdout and
+one named completion indicator to stderr:
+
+```text
+[Context Firewall] 28,981 B -> 1,846 B | 27,135 B initially avoided (93.63%) | escalation: no
+```
+
+To persist the deterministic receipt separately, the caller may request a
+sidecar:
+
+```bash
+node ./bin/context-firewall.js reduce \
+  --mechanism-revision REVISION \
+  --value-receipt value-receipt.json
+```
+
+The caller must keep stderr and the optional receipt sidecar outside initial
+decision-relevant model context. Invocation failures retain machine-readable
+stderr and emit no success indicator. A negative avoided-byte delta is reported
+as packet expansion rather than fabricated savings; ratios are not directly
+summable.
+
+`--mechanism-revision` is caller supplied, affects only the sidecar, and defaults
+to `null`; the deterministic reducer never inspects ambient Git state.
 
 ## Deterministic retention policy
 

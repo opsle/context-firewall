@@ -1,4 +1,10 @@
-import { INPUT_PROTOCOL, PayloadCeilingError, reduceTestRun, serializePacket } from '../src/reducer.js';
+import {
+  INPUT_PROTOCOL,
+  PayloadCeilingError,
+  reduceTestRun,
+  reduceWithValueReceipt,
+  serializePacket,
+} from '../src/reducer.js';
 
 function tap({ passed = [], failed = [], skipped = [], extras = [], finalNewline = true }) {
   const lines = ['TAP version 13'];
@@ -91,7 +97,7 @@ export function executeFixture(fixture) {
     ? { maxOutputBytes: exactCeiling(fixture.input) }
     : (fixture.options ?? {});
   try {
-    const packet = reduceTestRun(fixture.input, options);
+    const { packet, valueReceipt } = reduceWithValueReceipt(fixture.input, options);
     const bytes = serializePacket(packet);
     const evidence = packet.decision_evidence;
     const expected = fixture.expected;
@@ -120,10 +126,20 @@ export function executeFixture(fixture) {
     );
     if (options.maxOutputBytes != null) checks.push(bytes.length <= options.maxOutputBytes);
     checks.push(packet.receipt.measurements.reduced_bytes === bytes.length);
+    checks.push(valueReceipt.schema === 'opsle.value-receipt.v1');
+    checks.push(valueReceipt.measurements.find(
+      (measurement) => measurement.id === 'raw_bytes',
+    )?.result === packet.receipt.measurements.original_bytes);
+    checks.push(valueReceipt.measurements.find(
+      (measurement) => measurement.id === 'initial_model_visible_bytes',
+    )?.result === bytes.length);
+    checks.push(valueReceipt.measurements.find(
+      (measurement) => measurement.id === 'escalation_required',
+    )?.result === packet.receipt.raw_evidence.escalation_required);
     checks.push(packet.receipt.measurements.original_bytes === fixture.input.streams.reduce(
       (sum, stream) => sum + Buffer.byteLength(stream.data, stream.encoding === 'base64' ? 'base64' : 'utf8'), 0,
     ));
-    return { packet, options, pass: checks.every(Boolean) };
+    return { packet, valueReceipt, options, pass: checks.every(Boolean) };
   } catch (error) {
     if (error instanceof PayloadCeilingError && fixture.expected.ceilingError) {
       return { error, options, pass: true };
@@ -168,6 +184,7 @@ export function conformanceReport() {
       verdict_preserved: fixture.expected.status == null
         ? null
         : packet.decision_evidence.status === fixture.expected.status,
+      value_receipt_schema: result.valueReceipt.schema,
     };
   });
   return {
@@ -175,5 +192,6 @@ export function conformanceReport() {
     fixture_count: fixtures.length,
     fixtures,
     protocol_version: 'opsle.context-firewall.conformance/v1',
+    value_receipt_schema: 'opsle.value-receipt.v1',
   };
 }

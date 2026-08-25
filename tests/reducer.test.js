@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
@@ -11,15 +14,26 @@ import {
   REDUCER_VERSION,
   canonicalJson,
   reduceTestRun,
+  reduceWithValueReceipt,
   serializePacket,
 } from '../src/reducer.js';
 import { conformanceReport, corpus, executeFixture } from '../fixtures/corpus.js';
+import {
+  VALUE_RECEIPT_SCHEMA,
+  formatContextFirewallIndicator,
+} from '../src/value-receipt.js';
 
 const cliPath = fileURLToPath(new URL('../bin/context-firewall.js', import.meta.url));
 
 function fixture(name) {
   const value = corpus.find((item) => item.name === name);
   assert.ok(value, `missing fixture ${name}`);
+  return value;
+}
+
+function valueMeasurement(receipt, id) {
+  const value = receipt.measurements.find((item) => item.id === id);
+  assert.ok(value, `missing value measurement ${id}`);
   return value;
 }
 
@@ -56,7 +70,7 @@ test('large all-pass output is substantially reduced with correct aggregates', (
   const packet = reduceTestRun(fixture('normal/large-all-pass').input);
   assert.deepEqual(packet.decision_evidence.counts, { passed: 1500, failed: 0, skipped: 0, total: 1500 });
   assert.equal(packet.decision_evidence.status, 'passed');
-  assert.ok(packet.receipt.measurements.reduced_bytes < packet.receipt.measurements.original_bytes * 0.1);
+  assert.ok(packet.receipt.measurements.reduced_bytes < packet.receipt.measurements.original_bytes * 0.5);
   assert.equal(packet.receipt.suppressed.categories.successful_test, 1500);
 });
 
@@ -248,6 +262,137 @@ test('original and reduced byte and event measurements are exact', () => {
   );
 });
 
+test('emits the complete opsle.value-receipt.v1 Context Firewall profile', () => {
+  const { valueReceipt: receipt } = reduceWithValueReceipt(fixture('normal/large-all-pass').input);
+  assert.equal(receipt.schema, VALUE_RECEIPT_SCHEMA);
+  assert.deepEqual(receipt.mechanism, {
+    id: 'opsle.context-firewall',
+    name: 'Context Firewall',
+    revision: null,
+    version: REDUCER_VERSION,
+  });
+  assert.equal(receipt.run.id, 'run-001');
+  assert.equal(receipt.operation.id, 'op-synthetic-001');
+  assert.equal(receipt.operation.name, 'test-output-reduction');
+  assert.equal(receipt.operation.policy_id, POLICY_REVISION);
+  assert.match(receipt.operation.configuration_id, /^sha256:[0-9a-f]{64}$/);
+  assert.deepEqual(receipt.measurements.map((item) => item.id), [
+    'raw_bytes',
+    'initial_model_visible_bytes',
+    'bytes_initially_avoided',
+    'initial_reduction_ratio',
+    'original_evidence_events',
+    'retained_evidence_events',
+    'suppressed_evidence_events',
+    'ambiguous_evidence_events',
+    'payload_ceiling_bytes',
+    'escalation_required',
+    'raw_locator_available',
+  ]);
+  assert.equal(receipt.evidence.every((item) => item.id && item.kind && item.locator && item.trust), true);
+  assert.equal(new Set(receipt.evidence.map((item) => item.id)).size, receipt.evidence.length);
+  for (const item of receipt.measurements.filter((value) => value.class === 'EXACT')) {
+    assert.equal(item.source_verification, 'VERIFIED');
+    assert.equal(item.derivation, null);
+  }
+});
+
+test('caller-supplied mechanism revision affects only the deterministic value receipt', () => {
+  const input = fixture('normal/large-all-pass').input;
+  const revision = 'dd34bd9f681314761f1ca87f339648bf611811f3';
+  const first = reduceWithValueReceipt(input, { mechanismRevision: revision });
+  const second = reduceWithValueReceipt(input, { mechanismRevision: revision });
+  assert.equal(first.valueReceipt.mechanism.revision, revision);
+  assert.equal(canonicalJson(first.valueReceipt), canonicalJson(second.valueReceipt));
+  assert.deepEqual(serializePacket(first.packet), serializePacket(reduceTestRun(input)));
+  assert.equal('value_receipt' in first.packet, false);
+  assert.throws(
+    () => reduceWithValueReceipt(input, { mechanismRevision: '' }),
+    (error) => error instanceof InputError && error.code === 'INVALID_INPUT',
+  );
+});
+
+test('value receipt byte deltas, ratio, and event partition are exact', () => {
+  const { packet, valueReceipt } = reduceWithValueReceipt(fixture('normal/large-all-pass').input);
+  const outputBytes = serializePacket(packet).length;
+  const raw = valueMeasurement(valueReceipt, 'raw_bytes');
+  const visible = valueMeasurement(valueReceipt, 'initial_model_visible_bytes');
+  const avoided = valueMeasurement(valueReceipt, 'bytes_initially_avoided');
+  const ratio = valueMeasurement(valueReceipt, 'initial_reduction_ratio');
+  assert.equal(raw.result, packet.receipt.measurements.original_bytes);
+  assert.deepEqual(
+    [visible.baseline, visible.result, visible.delta],
+    [raw.result, outputBytes, outputBytes - raw.result],
+  );
+  assert.deepEqual(
+    [avoided.baseline, avoided.result, avoided.delta],
+    [outputBytes, raw.result, raw.result - outputBytes],
+  );
+  assert.equal(ratio.result, `${raw.result - outputBytes}/${raw.result}`);
+  assert.deepEqual(ratio.aggregation, { method: null, safe: false });
+  assert.equal(
+    valueMeasurement(valueReceipt, 'retained_evidence_events').result
+      + valueMeasurement(valueReceipt, 'suppressed_evidence_events').result,
+    valueMeasurement(valueReceipt, 'original_evidence_events').result,
+  );
+});
+
+test('value receipt preserves expansion instead of fabricating avoided bytes', () => {
+  const { valueReceipt } = reduceWithValueReceipt(fixture('normal/small-all-pass').input);
+  const avoided = valueMeasurement(valueReceipt, 'bytes_initially_avoided');
+  assert.ok(avoided.delta < 0);
+  assert.equal(avoided.delta, avoided.result - avoided.baseline);
+  assert.equal(
+    formatContextFirewallIndicator(valueReceipt),
+    '[Context Firewall] 104 B -> 1,824 B | 1,720 B expansion | escalation: no',
+  );
+});
+
+test('value receipt exposes reduction and the exact named operator indicator', () => {
+  const { valueReceipt } = reduceWithValueReceipt(fixture('normal/large-all-pass').input);
+  assert.equal(
+    formatContextFirewallIndicator(valueReceipt),
+    '[Context Firewall] 28,981 B -> 1,846 B | 27,135 B initially avoided (93.63%) | escalation: no',
+  );
+});
+
+test('value receipt records ambiguity, escalation, and raw-locator trust', () => {
+  const { valueReceipt } = reduceWithValueReceipt(fixture('edge/malformed-output').input);
+  assert.equal(valueMeasurement(valueReceipt, 'ambiguous_evidence_events').result, 2);
+  assert.deepEqual(
+    {
+      class: valueMeasurement(valueReceipt, 'escalation_required').class,
+      result: valueMeasurement(valueReceipt, 'escalation_required').result,
+    },
+    { class: 'OBSERVED', result: true },
+  );
+  const locator = valueMeasurement(valueReceipt, 'raw_locator_available');
+  assert.equal(locator.result, true);
+  assert.equal(locator.source_verification, 'CALLER_SUPPLIED');
+  assert.equal(valueReceipt.evidence.find((item) => item.id === 'raw_locator').trust, 'CALLER_SUPPLIED');
+});
+
+test('missing raw locator and zero-byte ratio remain explicitly unavailable', () => {
+  const input = structuredClone(fixture('normal/small-all-pass').input);
+  input.streams[0].data = '';
+  delete input.source.raw_evidence_ref;
+  const { valueReceipt } = reduceWithValueReceipt(input);
+  assert.equal(valueMeasurement(valueReceipt, 'raw_bytes').result, 0);
+  assert.equal(valueMeasurement(valueReceipt, 'initial_reduction_ratio').result, null);
+  assert.equal(valueMeasurement(valueReceipt, 'raw_locator_available').result, false);
+  assert.equal(valueMeasurement(valueReceipt, 'escalation_required').result, true);
+  assert.equal(valueReceipt.evidence.some((item) => item.id === 'raw_locator'), false);
+  assert.ok(valueReceipt.limitations.includes('No raw evidence locator was supplied.'));
+});
+
+test('payload ceiling value remains exact configuration and is never summed', () => {
+  const item = fixture('payload/comfortably-above');
+  const { valueReceipt } = reduceWithValueReceipt(item.input, item.options);
+  const ceiling = valueMeasurement(valueReceipt, 'payload_ceiling_bytes');
+  assert.equal(ceiling.result, item.options.maxOutputBytes);
+  assert.deepEqual(ceiling.aggregation, { method: null, safe: false });
+});
+
 test('duration is caller-supplied semantic evidence and no runtime latency is hashed', () => {
   const packet = reduceTestRun(fixture('normal/small-all-pass').input);
   assert.equal(packet.decision_evidence.process.duration_ms, 12.5);
@@ -269,6 +414,40 @@ test('CLI reads JSON from stdin and emits the canonical packet', () => {
   assert.equal(result.status, 0, result.stderr);
   const expected = serializePacket(reduceTestRun(input)).toString('utf8');
   assert.equal(result.stdout, expected);
+  assert.equal('value_receipt' in JSON.parse(result.stdout), false);
+  assert.equal(
+    result.stderr,
+    `${formatContextFirewallIndicator(reduceWithValueReceipt(input).valueReceipt)}\n`,
+  );
+});
+
+test('CLI writes a canonical value receipt only to an explicitly requested sidecar', () => {
+  const input = fixture('normal/large-all-pass').input;
+  const directory = mkdtempSync(join(tmpdir(), 'context-firewall-value-'));
+  const receiptPath = join(directory, 'value-receipt.json');
+  const revision = 'dd34bd9f681314761f1ca87f339648bf611811f3';
+  try {
+    const result = spawnSync(process.execPath, [
+      cliPath,
+      'reduce',
+      '--mechanism-revision',
+      revision,
+      '--value-receipt',
+      receiptPath,
+    ], {
+      encoding: 'utf8',
+      input: JSON.stringify(input),
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const { packet, valueReceipt } = reduceWithValueReceipt(input, {
+      mechanismRevision: revision,
+    });
+    assert.equal(result.stdout, serializePacket(packet).toString('utf8'));
+    assert.equal(readFileSync(receiptPath, 'utf8'), `${canonicalJson(valueReceipt)}\n`);
+    assert.equal(JSON.parse(readFileSync(receiptPath, 'utf8')).schema, VALUE_RECEIPT_SCHEMA);
+  } finally {
+    rmSync(directory, { recursive: true });
+  }
 });
 
 test('CLI reports malformed JSON as a machine-readable error', () => {

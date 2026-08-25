@@ -15,12 +15,20 @@ caller-owned raw stdout/stderr
         v             v
  sufficient       NEEDS_RAW_EVIDENCE
  packet           packet/control error
+        |
+        +--> canonical packet (stdout/model channel)
+        |
+        +--> sibling value receipt (API/optional sidecar)
+        |
+        +--> [Context Firewall] indicator (stderr/operator channel)
 ```
 
 ## Modules
 
 - `src/reducer.js`: validation, byte framing, parsing, classification, policy,
   hashing, measurement, and canonical serialization.
+- `src/value-receipt.js`: dependency-free `opsle.value-receipt.v1` construction
+  and deterministic operator-indicator formatting.
 - `bin/context-firewall.js`: stdin/file CLI and deterministic conformance entry.
 - `fixtures/corpus.js`: synthetic public-safe fixture definitions and expected
   decisions.
@@ -29,6 +37,12 @@ caller-owned raw stdout/stderr
 
 The core has no host adapter or external package dependency. Supporting Opsle
 protocols can consume the JSON fields without importing this package.
+
+The value receipt is deliberately not embedded in the evidence packet. API
+callers receive it as a sibling result and CLI callers may request a deterministic
+sidecar. Canonical stdout therefore keeps the original compact model-context
+boundary. The one named stderr indicator is operator telemetry; callers must not
+merge it into model context automatically.
 
 ## Evidence ownership
 
