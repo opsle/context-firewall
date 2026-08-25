@@ -44,6 +44,34 @@ Object keys are serialized in lexical order with one final newline. Arrays retai
 source order. No time, latency, random ID, filesystem state, locale, or ambient
 environment value enters canonical output.
 
+## Visible Value contract
+
+The packet itself remains the compact model-visible output. A caller may derive a
+sibling `opsle.value-receipt.v1` with `reduceWithValueReceipt()` or request a
+canonical CLI sidecar with `--value-receipt`. The receipt is not embedded in the
+packet and does not increase model-visible stdout.
+
+The mechanism identity is `opsle.context-firewall`, the operation is
+`test-output-reduction`, and the receipt contains `raw_bytes`,
+`initial_model_visible_bytes`, `bytes_initially_avoided`,
+`initial_reduction_ratio`, `original_evidence_events`,
+`retained_evidence_events`, `suppressed_evidence_events`,
+`ambiguous_evidence_events`, `payload_ceiling_bytes`, `escalation_required`, and
+`raw_locator_available`.
+
+Byte and event measurements are `EXACT`; escalation and raw-locator state are
+`OBSERVED`. The avoided-byte delta is raw minus visible bytes and may be negative
+for packet expansion. The ratio is an exact signed numerator/denominator string
+and is not directly summable. A raw locator is caller supplied and is not proof
+that the external artifact exists or was verified. Byte evidence supports no
+token, cost, latency, correctness, or causal claim.
+
+An exact mechanism revision may be caller supplied. It affects only the sibling
+receipt and defaults to `null`; ambient repository state is never inspected.
+Successful CLI reductions write only the canonical packet to stdout and one
+named `[Context Firewall]` indicator to stderr. Invocation failures retain their
+machine-readable stderr behavior and emit no success indicator.
+
 ## Evidence taxonomy
 
 Source lines have exactly one class:
@@ -75,6 +103,10 @@ otherwise valid test names or explicit notes have no special meaning.
    sufficient packet.
 7. `measurements.reduced_bytes` equals the canonical serialized packet length.
 8. The input hash binds stream names, lengths, order, and exact bytes.
+9. Value-receipt visible bytes equal the final serialized packet length; deriving
+   or writing the receipt never changes packet bytes.
+10. Operator telemetry is derived from the completed sibling receipt and remains
+    outside canonical stdout.
 
 ## Payload policy
 

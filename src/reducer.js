@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
 import { TextDecoder } from 'node:util';
+import { buildReductionValueReceipt } from './value-receipt.js';
 
 export const INPUT_PROTOCOL = 'opsle.context-firewall.test-run-input/v1';
 export const PACKET_PROTOCOL = 'opsle.context-firewall.evidence-packet/v1';
 export const REDUCER_NAME = '@opsle/context-firewall/test-output';
-export const REDUCER_VERSION = '0.2.0';
+export const REDUCER_VERSION = '0.3.0';
 export const POLICY_REVISION = 'tap-subset-policy/v1';
 
 const ANSI_PATTERN = /[\u001b\u009b][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
@@ -515,4 +516,39 @@ export function reduceTestRun(input, options = {}) {
 
 export function serializePacket(packet) {
   return Buffer.from(`${canonicalJson(packet)}\n`, 'utf8');
+}
+
+export function valueReceiptForPacket(packet, { mechanismRevision = null } = {}) {
+  if (mechanismRevision != null && (typeof mechanismRevision !== 'string' || mechanismRevision.length === 0)) {
+    throw new InputError('mechanismRevision must be a nonempty string or null');
+  }
+  const measurements = packet.receipt.measurements;
+  return buildReductionValueReceipt({
+    ambiguousEvents: packet.decision_evidence.unclassified_evidence.length,
+    configurationIdentity: packet.receipt.configuration.identity,
+    escalationRequired: packet.receipt.raw_evidence.escalation_required,
+    inputHash: packet.receipt.input_hash,
+    mechanismRevision,
+    mechanismVersion: REDUCER_VERSION,
+    operationId: packet.operation_id,
+    originalBytes: measurements.original_bytes,
+    originalEvents: measurements.original_event_count,
+    payloadCeilingBytes: packet.receipt.configuration.max_output_bytes,
+    policyRevision: packet.receipt.configuration.policy_revision,
+    rawEvidenceRef: packet.receipt.raw_evidence.reference,
+    reducedBytes: measurements.reduced_bytes,
+    retainedEvents: measurements.retained_evidence_count,
+    runId: packet.receipt.source.run_id,
+    semanticPayloadHash: packet.receipt.semantic_payload_hash,
+  });
+}
+
+export function reduceWithValueReceipt(input, options = {}) {
+  const packet = reduceTestRun(input, options);
+  return {
+    packet,
+    valueReceipt: valueReceiptForPacket(packet, {
+      mechanismRevision: options.mechanismRevision ?? null,
+    }),
+  };
 }
