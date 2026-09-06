@@ -4,8 +4,9 @@ import { buildReductionValueReceipt } from './value-receipt.js';
 
 export const INPUT_PROTOCOL = 'opsle.context-firewall.test-run-input/v1';
 export const PACKET_PROTOCOL = 'opsle.context-firewall.evidence-packet/v1';
+export const MODEL_EVIDENCE_PROTOCOL = 'opsle.context-firewall.model-evidence/v1';
 export const REDUCER_NAME = '@opsle/context-firewall/test-output';
-export const REDUCER_VERSION = '0.3.0';
+export const REDUCER_VERSION = '0.4.0';
 export const POLICY_REVISION = 'tap-subset-policy/v1';
 
 const ANSI_PATTERN = /[\u001b\u009b][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
@@ -516,6 +517,30 @@ export function reduceTestRun(input, options = {}) {
 
 export function serializePacket(packet) {
   return Buffer.from(`${canonicalJson(packet)}\n`, 'utf8');
+}
+
+export function modelEvidenceForPacket(packet) {
+  if (!isPlainObject(packet) || packet.protocol_version !== PACKET_PROTOCOL
+    || typeof packet.operation_id !== 'string' || !packet.operation_id
+    || !isPlainObject(packet.decision_evidence)) {
+    throw new InputError('a valid Context Firewall evidence packet is required');
+  }
+  return {
+    decision_evidence: packet.decision_evidence,
+    operation_id: packet.operation_id,
+    protocol_version: MODEL_EVIDENCE_PROTOCOL,
+  };
+}
+
+export function serializeModelEvidence(modelEvidence) {
+  if (!isPlainObject(modelEvidence)
+    || modelEvidence.protocol_version !== MODEL_EVIDENCE_PROTOCOL
+    || typeof modelEvidence.operation_id !== 'string'
+    || !modelEvidence.operation_id
+    || !isPlainObject(modelEvidence.decision_evidence)) {
+    throw new InputError('a valid Context Firewall model-evidence projection is required');
+  }
+  return Buffer.from(`${canonicalJson(modelEvidence)}\n`, 'utf8');
 }
 
 export function valueReceiptForPacket(packet, { mechanismRevision = null } = {}) {

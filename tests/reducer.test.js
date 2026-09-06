@@ -8,13 +8,16 @@ import { fileURLToPath } from 'node:url';
 import {
   INPUT_PROTOCOL,
   InputError,
+  MODEL_EVIDENCE_PROTOCOL,
   PACKET_PROTOCOL,
   POLICY_REVISION,
   PayloadCeilingError,
   REDUCER_VERSION,
   canonicalJson,
+  modelEvidenceForPacket,
   reduceTestRun,
   reduceWithValueReceipt,
+  serializeModelEvidence,
   serializePacket,
 } from '../src/reducer.js';
 import { conformanceReport, corpus, executeFixture } from '../fixtures/corpus.js';
@@ -56,6 +59,24 @@ test('canonical output contains no generated time or random identity', () => {
   const output = serializePacket(packet).toString('utf8');
   assert.equal(/timestamp|created_at|generated_at|random|uuid/i.test(output), false);
   assert.equal(packet.operation_id, 'op-synthetic-001');
+});
+
+test('model evidence is an explicit semantic-only projection', () => {
+  const packet = reduceTestRun(fixture('failure/stack-trace').input);
+  const projection = modelEvidenceForPacket(packet);
+  const output = serializeModelEvidence(projection);
+  assert.deepEqual(projection, {
+    decision_evidence: packet.decision_evidence,
+    operation_id: packet.operation_id,
+    protocol_version: MODEL_EVIDENCE_PROTOCOL,
+  });
+  assert.equal('receipt' in projection, false);
+  assert.equal(output.toString('utf8'), `${canonicalJson(projection)}\n`);
+  assert.ok(output.length < serializePacket(packet).length);
+  assert.throws(
+    () => modelEvidenceForPacket({ protocol_version: PACKET_PROTOCOL }),
+    (error) => error instanceof InputError && error.code === 'INVALID_INPUT',
+  );
 });
 
 test('packet identifies exact protocol, reducer, policy, and configuration', () => {
@@ -424,6 +445,7 @@ test('CLI reads JSON from stdin and emits the canonical packet', () => {
 test('CLI writes a canonical value receipt only to an explicitly requested sidecar', () => {
   const input = fixture('normal/large-all-pass').input;
   const directory = mkdtempSync(join(tmpdir(), 'context-firewall-value-'));
+  const modelEvidencePath = join(directory, 'model-evidence.json');
   const receiptPath = join(directory, 'value-receipt.json');
   const revision = 'dd34bd9f681314761f1ca87f339648bf611811f3';
   try {
@@ -432,6 +454,8 @@ test('CLI writes a canonical value receipt only to an explicitly requested sidec
       'reduce',
       '--mechanism-revision',
       revision,
+      '--model-evidence',
+      modelEvidencePath,
       '--value-receipt',
       receiptPath,
     ], {
@@ -444,7 +468,12 @@ test('CLI writes a canonical value receipt only to an explicitly requested sidec
     });
     assert.equal(result.stdout, serializePacket(packet).toString('utf8'));
     assert.equal(readFileSync(receiptPath, 'utf8'), `${canonicalJson(valueReceipt)}\n`);
+    assert.equal(
+      readFileSync(modelEvidencePath, 'utf8'),
+      serializeModelEvidence(modelEvidenceForPacket(packet)).toString('utf8'),
+    );
     assert.equal(JSON.parse(readFileSync(receiptPath, 'utf8')).schema, VALUE_RECEIPT_SCHEMA);
+    assert.equal(JSON.parse(readFileSync(modelEvidencePath, 'utf8')).protocol_version, MODEL_EVIDENCE_PROTOCOL);
   } finally {
     rmSync(directory, { recursive: true });
   }

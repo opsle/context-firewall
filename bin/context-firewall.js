@@ -6,19 +6,22 @@ import {
   InputError,
   PayloadCeilingError,
   canonicalJson,
+  modelEvidenceForPacket,
   reduceWithValueReceipt,
+  serializeModelEvidence,
   serializePacket,
 } from '../src/reducer.js';
 import { formatContextFirewallIndicator } from '../src/value-receipt.js';
 
 function usage() {
-  return 'usage: context-firewall reduce [--input PATH|-] [--max-bytes N] [--mechanism-revision REV] [--value-receipt PATH]\n       context-firewall conformance\n';
+  return 'usage: context-firewall reduce [--input PATH|-] [--max-bytes N] [--mechanism-revision REV] [--model-evidence PATH] [--value-receipt PATH]\n       context-firewall conformance\n';
 }
 
 function parseReduceArgs(args) {
   let input = '-';
   let maxOutputBytes = null;
   let mechanismRevision = null;
+  let modelEvidencePath = null;
   let valueReceiptPath = null;
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === '--input' && args[index + 1]) input = args[++index];
@@ -26,11 +29,13 @@ function parseReduceArgs(args) {
       maxOutputBytes = Number(args[++index]);
     } else if (args[index] === '--mechanism-revision' && args[index + 1]) {
       mechanismRevision = args[++index];
+    } else if (args[index] === '--model-evidence' && args[index + 1]) {
+      modelEvidencePath = args[++index];
     } else if (args[index] === '--value-receipt' && args[index + 1]) {
       valueReceiptPath = args[++index];
     } else throw new InputError(`unknown or incomplete argument: ${args[index]}`);
   }
-  return { input, maxOutputBytes, mechanismRevision, valueReceiptPath };
+  return { input, maxOutputBytes, mechanismRevision, modelEvidencePath, valueReceiptPath };
 }
 
 async function readInput(path) {
@@ -68,6 +73,12 @@ async function main() {
   });
   if (options.valueReceiptPath) {
     await writeFile(options.valueReceiptPath, `${canonicalJson(valueReceipt)}\n`, 'utf8');
+  }
+  if (options.modelEvidencePath) {
+    await writeFile(
+      options.modelEvidencePath,
+      serializeModelEvidence(modelEvidenceForPacket(packet)),
+    );
   }
   process.stdout.write(serializePacket(packet));
   process.stderr.write(`${formatContextFirewallIndicator(valueReceipt)}\n`);

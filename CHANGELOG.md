@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 - 2026-09-06
+
+- Added the compatible `opsle.context-firewall.model-evidence/v1` semantic-only
+  projection and optional `--model-evidence` sidecar.
+- Kept the existing evidence packet, receipt, hashes, reduction, escalation,
+  and canonical stdout behavior unchanged apart from the declared reducer
+  version.
+- Clarified that downstream consumers must measure actual provider submission;
+  producer packet-size measurements do not prove delivery.
+
 ## 0.3.0 - 2026-08-25
 
 - Added a dependency-free sibling `opsle.value-receipt.v1` for reductions with

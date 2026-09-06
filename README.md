@@ -13,7 +13,7 @@ safely not see?** This repository does not yet answer it.
 
 ## Prototype scope
 
-Version 0.3.0 is a dependency-free Node.js reference reducer for a documented
+Version 0.4.0 is a dependency-free Node.js reference reducer for a documented
 flat TAP-compatible test-output subset. It:
 
 - reads caller-supplied stdout and stderr bytes plus process metadata;
@@ -149,6 +149,29 @@ decision-relevant model context. Invocation failures retain machine-readable
 stderr and emit no success indicator. A negative avoided-byte delta is reported
 as packet expansion rather than fabricated savings; ratios are not directly
 summable.
+
+## Semantic-only model evidence
+
+The canonical packet remains the compatible default stdout representation. A
+caller that retains the packet as audit evidence can request an explicit
+semantic-only sidecar with `--model-evidence PATH`. Its protocol is
+`opsle.context-firewall.model-evidence/v1` and it contains only
+`protocol_version`, `operation_id`, and the packet's byte-identical
+`decision_evidence` value. It deliberately excludes the packet `receipt`.
+
+```bash
+node ./bin/context-firewall.js reduce \
+  --model-evidence model-evidence.json
+```
+
+`modelEvidenceForPacket()` and `serializeModelEvidence()` expose the same
+deterministic projection to library callers. The sidecar is a supported
+model-facing representation, not a second reduction: the full packet remains
+the audit authority and the projection changes no classification, retention,
+hash, receipt, or canonical stdout behavior. Callers must measure and record
+what they actually submit; the producer's legacy `initial_model_visible_bytes`
+measurement continues to describe canonical packet stdout, not downstream
+delivery of this optional projection.
 
 `--mechanism-revision` is caller supplied, affects only the sidecar, and defaults
 to `null`; the deterministic reducer never inspects ambient Git state.
