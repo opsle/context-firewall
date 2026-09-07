@@ -2,7 +2,10 @@
 
 Status: experimental prototype contract.
 
-Version: `opsle.context-firewall.evidence-packet/v1`.
+Packet version: `opsle.context-firewall.evidence-packet/v1`.
+
+Model-evidence projection version:
+`opsle.context-firewall.model-evidence/v1`.
 
 ## Compatibility boundary
 
@@ -46,10 +49,21 @@ environment value enters canonical output.
 
 ## Visible Value contract
 
-The packet itself remains the compact model-visible output. A caller may derive a
+The packet remains the compatible default model-visible stdout. A caller may derive a
 sibling `opsle.value-receipt.v1` with `reduceWithValueReceipt()` or request a
 canonical CLI sidecar with `--value-receipt`. The receipt is not embedded in the
 packet and does not increase model-visible stdout.
+
+A caller that retains the full packet as audit evidence may request the
+supported semantic-only `opsle.context-firewall.model-evidence/v1` projection
+with `--model-evidence` or derive it with `modelEvidenceForPacket()`. The
+projection contains the packet operation identity and its exact
+`decision_evidence`, but excludes the packet `receipt`. It is deterministic and
+does not change packet bytes, hashes, classification, retention, or escalation.
+Downstream consumers remain responsible for measuring actual submission. The
+existing `initial_model_visible_bytes` measurement continues to describe the
+canonical packet stdout for compatibility; it does not claim that a downstream
+consumer submitted either representation.
 
 The mechanism identity is `opsle.context-firewall`, the operation is
 `test-output-reduction`, and the receipt contains `raw_bytes`,
@@ -107,6 +121,8 @@ otherwise valid test names or explicit notes have no special meaning.
    or writing the receipt never changes packet bytes.
 10. Operator telemetry is derived from the completed sibling receipt and remains
     outside canonical stdout.
+11. Model-evidence projection preserves packet `operation_id` and
+    `decision_evidence` exactly while excluding the packet `receipt`.
 
 ## Payload policy
 
