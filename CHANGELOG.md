@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0 - 2026-09-08
+
+- Classify Node's native spec reporter pass, fail, skip, aggregate, and timing
+  records while retaining failure diagnostics and honestly escalating unknown
+  output.
+- Treat native dot-reporter progress as structure, so repetitive successful
+  verification does not become hash-per-line model evidence.
+- Preserve the canonical audit packet and semantic model-evidence projection as
+  distinct artifacts with exact UTF-8 byte accounting.
+
 ## 0.4.0 - 2026-09-06
 
 - Added the compatible `opsle.context-firewall.model-evidence/v1` semantic-only

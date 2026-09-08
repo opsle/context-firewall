@@ -7,6 +7,9 @@ Packet version: `opsle.context-firewall.evidence-packet/v1`.
 Model-evidence projection version:
 `opsle.context-firewall.model-evidence/v1`.
 
+Reducer policy revision: `test-output-policy/v2`. It recognizes the documented
+TAP subset and Node's native spec and dot reporter records.
+
 ## Compatibility boundary
 
 The reference primitive accepts generic test-run bytes and emits generic
