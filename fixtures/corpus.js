@@ -25,6 +25,26 @@ function tap({ passed = [], failed = [], skipped = [], extras = [], finalNewline
   return `${lines.join('\n')}${finalNewline ? '\n' : ''}`;
 }
 
+function nodeSpec({ passed = [], failed = [], skipped = [], extras = [] }) {
+  const lines = [];
+  for (const name of passed) lines.push(`✔ ${name} (1.25ms)`);
+  for (const name of skipped) lines.push(`﹣ ${name} (0.1ms) # SKIP`);
+  for (const failure of failed) {
+    lines.push(`✖ ${failure.name} (2.5ms)`);
+    lines.push(...(failure.details ?? []).map((detail) => `  ${detail}`));
+  }
+  lines.push(...extras);
+  lines.push(`ℹ tests ${passed.length + failed.length + skipped.length}`);
+  lines.push('ℹ suites 0');
+  lines.push(`ℹ pass ${passed.length}`);
+  lines.push(`ℹ fail ${failed.length}`);
+  lines.push('ℹ cancelled 0');
+  lines.push(`ℹ skipped ${skipped.length}`);
+  lines.push('ℹ todo 0');
+  lines.push('ℹ duration_ms 12.5');
+  return `${lines.join('\n')}\n`;
+}
+
 function invocation({
   stdout = '', stderr = '', exitCode = 0, interrupted = false,
   source = true, rawRef = true, operationId = true, durationMs = 12.5,
@@ -45,6 +65,8 @@ function invocation({
 
 const manyPasses = Array.from({ length: 1500 }, (_, index) => `case-${String(index + 1).padStart(4, '0')}`);
 const repetitivePasses = Array.from({ length: 400 }, () => 'repetitive-success');
+const task16Passes = Array.from({ length: 112 }, (_, index) =>
+  `task-16-case-${index + 1}-${'repetitive-success-detail-'.repeat(3)}`);
 const longName = `very-long-${'x'.repeat(40_000)}`;
 const longFailure = `message: ${'critical'.repeat(4_000)}`;
 
@@ -53,7 +75,10 @@ export const corpus = Object.freeze([
   { name: 'normal/large-all-pass', input: invocation({ stdout: tap({ passed: manyPasses }) }), expected: { status: 'passed', disposition: 'SUFFICIENT', counts: [1500, 0, 0], substantialReduction: true } },
   { name: 'normal/repetitive-success', input: invocation({ stdout: tap({ passed: repetitivePasses }) }), expected: { status: 'passed', counts: [400, 0, 0], substantialReduction: true } },
   { name: 'normal/skipped-tests', input: invocation({ stdout: tap({ passed: ['runs'], skipped: ['not-applicable', 'platform-only'] }) }), expected: { status: 'passed', counts: [1, 0, 2] } },
+  { name: 'normal/node-spec-task-16', input: invocation({ stdout: nodeSpec({ passed: task16Passes, skipped: ['external-a', 'external-b', 'external-c'], extras: ['> package@1.0.0 test', '> node --test', 'ℹ {"bounded":"diagnostic"}', 'Switched to a new branch \'feature\''] }) }), options: { maxOutputBytes: 12_000 }, expected: { status: 'passed', disposition: 'SUFFICIENT', counts: [112, 0, 3], substantialReduction: true } },
+  { name: 'normal/node-dot-progress', input: invocation({ stdout: nodeSpec({ passed: ['alpha', 'beta'], extras: ['..'] }) }), expected: { status: 'passed', disposition: 'SUFFICIENT', counts: [2, 0, 0] } },
   { name: 'failure/one', input: invocation({ stdout: tap({ failed: [{ name: 'adds values', details: ['message: expected two', 'expected: 2', 'actual: 3'] }] }), exitCode: 1 }), expected: { status: 'failed', failures: 1, contains: ['adds values', 'expected two'] } },
+  { name: 'failure/node-spec', input: invocation({ stdout: nodeSpec({ passed: ['green'], failed: [{ name: 'adds values', details: ['error: expected two', 'expected: 2', 'actual: 3', 'at test (file:///public/test.js:4:5)'] }] }), exitCode: 1 }), expected: { status: 'failed', disposition: 'SUFFICIENT', counts: [1, 1, 0], failures: 1, contains: ['adds values', 'expected two', 'file:///public/test.js:4:5'] } },
   { name: 'failure/several', input: invocation({ stdout: tap({ failed: [{ name: 'first', details: ['message: first broke'] }, { name: 'second', details: ['message: second broke'] }, { name: 'third', details: ['message: third broke'] }] }), exitCode: 1 }), expected: { status: 'failed', failures: 3, contains: ['first broke', 'second broke', 'third broke'] } },
   { name: 'failure/mixed-pass-fail', input: invocation({ stdout: tap({ passed: ['green-a', 'green-b'], failed: [{ name: 'red', details: ['message: broken'] }] }), exitCode: 1 }), expected: { status: 'failed', counts: [2, 1, 0], failures: 1 } },
   { name: 'failure/assertion-difference', input: invocation({ stdout: tap({ failed: [{ name: 'diffs objects', details: ['operator: deepStrictEqual', 'expected: {a: 1}', 'actual: {a: 2}', 'diff: -1 +2'] }] }), exitCode: 1 }), expected: { status: 'failed', contains: ['deepStrictEqual', 'diff: -1 +2'] } },

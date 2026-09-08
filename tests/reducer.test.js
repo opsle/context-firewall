@@ -95,6 +95,29 @@ test('large all-pass output is substantially reduced with correct aggregates', (
   assert.equal(packet.receipt.suppressed.categories.successful_test, 1500);
 });
 
+test('Node spec output retains counts and diagnostics without retaining passing repetition', () => {
+  const task16 = fixture('normal/node-spec-task-16');
+  const packet = reduceTestRun(task16.input, task16.options);
+  const packetBytes = serializePacket(packet).length;
+  const modelBytes = serializeModelEvidence(modelEvidenceForPacket(packet)).length;
+  assert.deepEqual(packet.decision_evidence.counts,
+    { passed: 112, failed: 0, skipped: 3, total: 115 });
+  assert.equal(packet.decision_evidence.status, 'passed');
+  assert.equal(packet.decision_evidence.disposition, 'SUFFICIENT');
+  assert.equal(packet.decision_evidence.unclassified_evidence.length, 0);
+  assert.equal(packet.receipt.suppressed.categories.successful_test, 112);
+  assert.equal(packet.receipt.suppressed.categories.skipped_test, 3);
+  assert.ok(packetBytes <= 12_000);
+  assert.ok(modelBytes < packetBytes);
+  assert.ok(packetBytes < packet.receipt.measurements.original_bytes);
+
+  const failure = reduceTestRun(fixture('failure/node-spec').input);
+  assert.equal(failure.decision_evidence.status, 'failed');
+  assert.equal(failure.decision_evidence.failures[0].identity, 'adds values');
+  assert.ok(failure.decision_evidence.failures[0].details
+    .some(item => item.text.includes('file:///public/test.js:4:5')));
+});
+
 test('a failed test retains identity, message, assertion, and location', () => {
   const packet = reduceTestRun(fixture('failure/one').input);
   const [failure] = packet.decision_evidence.failures;
@@ -365,7 +388,7 @@ test('value receipt preserves expansion instead of fabricating avoided bytes', (
   assert.equal(avoided.delta, avoided.result - avoided.baseline);
   assert.equal(
     formatContextFirewallIndicator(valueReceipt),
-    '[Context Firewall] 104 B -> 1,824 B | 1,720 B expansion | escalation: no',
+    '[Context Firewall] 104 B -> 1,825 B | 1,721 B expansion | escalation: no',
   );
 });
 
@@ -373,7 +396,7 @@ test('value receipt exposes reduction and the exact named operator indicator', (
   const { valueReceipt } = reduceWithValueReceipt(fixture('normal/large-all-pass').input);
   assert.equal(
     formatContextFirewallIndicator(valueReceipt),
-    '[Context Firewall] 28,981 B -> 1,846 B | 27,135 B initially avoided (93.63%) | escalation: no',
+    '[Context Firewall] 28,981 B -> 1,847 B | 27,134 B initially avoided (93.63%) | escalation: no',
   );
 });
 
@@ -505,9 +528,9 @@ test('CLI keeps an impossible-ceiling error off model-visible stdout', () => {
   assert.equal(error.disposition, 'NEEDS_RAW_EVIDENCE');
 });
 
-test('all 30 synthetic fixtures conform', () => {
+test('all 33 synthetic fixtures conform', () => {
   const report = conformanceReport();
-  assert.equal(report.fixture_count, 30);
+  assert.equal(report.fixture_count, 33);
   assert.equal(report.conformance, 'PASS');
   assert.equal(report.fixtures.every((item) => item.conformance === 'PASS'), true);
 });

@@ -6,8 +6,8 @@ export const INPUT_PROTOCOL = 'opsle.context-firewall.test-run-input/v1';
 export const PACKET_PROTOCOL = 'opsle.context-firewall.evidence-packet/v1';
 export const MODEL_EVIDENCE_PROTOCOL = 'opsle.context-firewall.model-evidence/v1';
 export const REDUCER_NAME = '@opsle/context-firewall/test-output';
-export const REDUCER_VERSION = '0.4.0';
-export const POLICY_REVISION = 'tap-subset-policy/v1';
+export const REDUCER_VERSION = '0.5.0';
+export const POLICY_REVISION = 'test-output-policy/v2';
 
 const ANSI_PATTERN = /[\u001b\u009b][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
@@ -191,19 +191,26 @@ function parseTranscript(streams) {
       const line = { stream: stream.name, line: index + 1, text: rawLine };
       const clean = rawLine.replace(/\r$/, '').replace(ANSI_PATTERN, '');
       const marker = clean.match(/^\s*(not ok|ok)\b(?:\s+\d+)?(?:\s*-\s*)?(.*)$/);
-      const summary = clean.match(/^\s*#\s*(tests|pass|fail|skipped)\s+(\d+)\s*$/);
+      const nodeMarker = clean.match(/^\s*([✔✖﹣])\s+(.+?)(?:\s+\([^)]*ms\))?(?:\s+#\s*(SKIP|TODO)\b.*)?$/u);
+      const summary = clean.match(/^\s*(?:#|ℹ)\s*(tests|pass|fail|skipped)\s+(\d+)\s*$/u);
 
-      if (marker) {
+      if (marker || nodeMarker) {
         currentFailure = null;
-        const directive = marker[2].match(/\s+#\s*(SKIP|TODO)\b.*$/i);
-        const identity = marker[2].replace(/\s+#\s*(?:SKIP|TODO)\b.*$/i, '').trim() || '(unnamed test)';
-        if (marker[1] === 'ok' && directive?.[1].toUpperCase() === 'SKIP') {
+        const tapDirective = marker?.[2].match(/\s+#\s*(SKIP|TODO)\b.*$/i);
+        const directive = tapDirective?.[1] || nodeMarker?.[3];
+        const identity = marker
+          ? marker[2].replace(/\s+#\s*(?:SKIP|TODO)\b.*$/i, '').trim() || '(unnamed test)'
+          : nodeMarker[2].trim() || '(unnamed test)';
+        const successful = marker ? marker[1] === 'ok' : nodeMarker[1] === '✔';
+        const skipped = nodeMarker?.[1] === '﹣'
+          || (successful && directive?.toUpperCase() === 'SKIP');
+        if (skipped) {
           line.kind = 'skipped_test';
           observed.skipped += 1;
-        } else if (marker[1] === 'ok') {
+        } else if (successful) {
           line.kind = 'successful_test';
           observed.passed += 1;
-        } else if (directive?.[1].toUpperCase() === 'TODO') {
+        } else if (directive?.toUpperCase() === 'TODO') {
           line.kind = 'unclassified';
           unclassified.push(line);
         } else {
@@ -242,8 +249,12 @@ function parseTranscript(streams) {
         } else if (warning) {
           line.kind = 'abnormal_warning';
           warnings.push(line);
-        } else if (/^\s*#\s*(?:duration_ms\s+\d+(?:\.\d+)?|note:\s*.*)\s*$/.test(clean)) {
+        } else if (/^\s*(?:#|ℹ)\s*(?:duration_ms\s+\d+(?:\.\d+)?|(?:suites|cancelled|todo)\s+\d+|note:\s*.*)\s*$/u.test(clean)) {
           line.kind = clean.includes('duration_ms') ? 'duration_source' : 'informational';
+        } else if (/^\s*(?:>\s+\S.*|ℹ\s+.*|Switched to (?:a new branch|branch) .*)$/u.test(clean)) {
+          line.kind = 'informational';
+        } else if (/^\s*[.X]+\s*$/.test(clean)) {
+          line.kind = 'progress';
         } else if (/^\s*$/.test(clean)) {
           line.kind = 'blank';
         } else {

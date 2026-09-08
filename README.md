@@ -13,8 +13,8 @@ safely not see?** This repository does not yet answer it.
 
 ## Prototype scope
 
-Version 0.4.0 is a dependency-free Node.js reference reducer for a documented
-flat TAP-compatible test-output subset. It:
+Version 0.5.0 is a dependency-free Node.js reference reducer for a documented
+flat TAP-compatible subset plus Node's native spec and dot reporters. It:
 
 - reads caller-supplied stdout and stderr bytes plus process metadata;
 - derives test verdict and pass, fail, and skip counts;
