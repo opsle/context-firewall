@@ -8,3 +8,11 @@ payload ceilings, raw escalation, CLI failure behavior, and the complete
 synthetic conformance corpus.
 
 These tests establish prototype behavior, not the EXP-001 hypothesis.
+
+`tasks-capability.test.js` is the missing-input blocker regression for task 22.
+It runs automatically under `npm test`, packs and installs the external package
+offline, checks pinned Tasks fixture hashes, and exercises the unchanged generic
+loader in isolated fresh processes without the host checkout. It covers the
+operator authority lifecycle and the package's semantic/private evidence
+boundaries. Missing or mismatched inputs fail rather than skip. This establishes
+reproducible package compatibility, not Tasks bundled-removal or provider delivery.

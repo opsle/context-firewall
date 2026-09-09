@@ -268,3 +268,7 @@ See [THEORY.md](THEORY.md), [SPEC.md](SPEC.md), and
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+The independently versioned [Opsle Tasks capability package](capabilities/tasks/README.md)
+provides the external adapter, explicit operator grant configuration, and a pinned
+isolated compatibility regression in the normal test catalog.

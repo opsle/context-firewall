@@ -1,0 +1,430 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { resolve } from 'node:path';
+import {
+  CAPABILITY_MANIFEST_SCHEMA,
+  CAPABILITY_GRANTS_SCHEMA,
+  CAPABILITY_RESULT_SCHEMA,
+  CAPABILITY_SELECTION_SCHEMA,
+  createCapabilityRuntime,
+  discoverCapabilities,
+  readRepositoryCapabilitySelection,
+  validateCapabilityGrants,
+  validateCapabilitySelection,
+} from '../src/capabilities.js';
+
+const tasksRoot = resolve(new URL('..', import.meta.url).pathname);
+const resultSource = `export function createCapability({manifest}) { return {
+  health() { return {available:true,detail:null}; },
+  invoke(hook,payload) { const output=manifest.hooks.find(item=>item.name===hook).outputSchema; return {schema:'${CAPABILITY_RESULT_SCHEMA}',capability:manifest.id,hook,output_schema:output,status:'ok',value:{...payload,schema:output},receipts:[],events:[]}; }
+}; }\n`;
+
+function temporary(t) {
+  const path = mkdtempSync(resolve(tmpdir(), 'opsle-capabilities-'));
+  t.after(() => rmSync(path, { recursive: true, force: true }));
+  return path;
+}
+
+function install(root, {
+  id,
+  name = id,
+  version = '1.0.0',
+  defaultEnabled = false,
+  hooks = [{ name: 'example.run', role: 'authority', execution: 'deterministic', failure: 'required' }],
+  requires = [],
+  source = resultSource,
+  directory = id,
+  configuration = {},
+  configurationSchema = null,
+} = {}) {
+  const path = resolve(root, directory);
+  mkdirSync(path, { recursive: true });
+  writeFileSync(resolve(path, 'adapter.mjs'), source);
+  writeFileSync(resolve(path, 'opsle-capability.json'), `${JSON.stringify({
+    schema: CAPABILITY_MANIFEST_SCHEMA,
+    id,
+    name,
+    version,
+    adapter: 'adapter.mjs',
+    default_enabled: defaultEnabled,
+    ...(configurationSchema ? { configuration_schema: configurationSchema } : {}),
+    configuration,
+    requires,
+    hooks: hooks.map(hook => ({ input_schema: 'opsle.test.input.v1',
+      output_schema: 'opsle.test.output.v1', ...hook })),
+  }, null, 2)}\n`);
+  return path;
+}
+
+const selection = ({ enable = [], disable = [], configuration = {} } = {}) =>
+  validateCapabilitySelection({
+    schema: CAPABILITY_SELECTION_SCHEMA, enable, disable, configuration,
+  });
+
+function runtimeOptions(root, capabilitySelection, events = [], grants = []) {
+  return {
+    config: { root: tasksRoot, capabilityRoots: [root], logsDir: root, databasePath: resolve(root, 'tasks.sqlite') },
+    task: { id: 7, repo_path: root, path: root, provider_choice: 'auto',
+      capability_grants: { schema: CAPABILITY_GRANTS_SCHEMA, allow: grants } },
+    attemptId: 11,
+    executionId: 'fixture-task-7-attempt-11',
+    model: null,
+    store: null,
+    selection: capabilitySelection,
+    emitEvent: (kind, message) => events.push({ kind, message }),
+  };
+}
+
+test('bundled compatibility capabilities are manifest-discovered, not source-listed', () => {
+  const capabilities = discoverCapabilities({ root: tasksRoot });
+  assert.deepEqual(capabilities.map(item => item.id), [
+    'opsle.affected-verification',
+    'opsle.context-firewall',
+    'opsle.gearbox',
+    'opsle.question-recommendation',
+    'opsle.visible-value',
+  ]);
+  assert.ok(capabilities.every(item => item.hooks.length > 0));
+});
+
+test('install, enable, invoke, disable, and remove require no substrate edit', async t => {
+  const root = temporary(t);
+  const installed = install(root, { id: 'opsle.future-tool', name: 'Future Tool',
+    hooks: [{ name: 'example.run', role: 'observer', execution: 'deterministic', failure: 'advisory' }] });
+  assert.deepEqual(discoverCapabilities({ root: tasksRoot, capabilityRoots: [root] })
+    .map(item => item.id), ['opsle.future-tool']);
+
+  const events = [];
+  const runtime = await createCapabilityRuntime(runtimeOptions(root,
+    selection({ enable: ['opsle.future-tool'] }), events, ['opsle.future-tool']));
+  const providers = { arbitrary_provider: { available: true, model: null } };
+  const results = await runtime.invoke('example.run', {
+    schema: 'opsle.test.input.v1', providers, phase: 'PLAN',
+  });
+  const value = results[0].result.value;
+  assert.deepEqual(value.providers, providers);
+  await assert.rejects(runtime.invoke('example.run', {
+    schema: 'opsle.test.input.v2',
+  }), /requires input schema opsle.test.input.v1/);
+  const event = JSON.parse(events.find(item => item.kind === 'CAPABILITY').message);
+  assert.equal(event.id, 'opsle.future-tool');
+  assert.match(event.implementation, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(event.input_schema, 'opsle.test.input.v1');
+  assert.equal(event.output_schema, 'opsle.test.output.v1');
+
+  const disabled = await createCapabilityRuntime(runtimeOptions(root,
+    selection({ disable: ['opsle.future-tool'] }), [], ['opsle.future-tool']));
+  assert.deepEqual(await disabled.invoke('example.run', {
+    schema: 'opsle.test.input.v1',
+  }), []);
+
+  rmSync(installed, { recursive: true });
+  assert.deepEqual(discoverCapabilities({ root: tasksRoot, capabilityRoots: [root] }), []);
+});
+
+test('model-backed capabilities require a bounded Gearbox decision before using the gateway', async t => {
+  const root = temporary(t);
+  install(root, {
+    id: 'opsle.route-authority',
+    defaultEnabled: true,
+    hooks: [{ name: 'route.select', role: 'authority', execution: 'deterministic', failure: 'required',
+      input_schema: 'opsle.execution.route-request.v1', output_schema: 'opsle.execution.route-decision.v1' }],
+    source: `export function createCapability({manifest}) { return {invoke(hook,payload) {
+      return {schema:'${CAPABILITY_RESULT_SCHEMA}',capability:manifest.id,hook,output_schema:'opsle.execution.route-decision.v1',status:'ok',value:{schema:'opsle.execution.route-decision.v1',phase:payload.phase,route:'future-provider',reason:'fixture decision'},receipts:[],events:[]};
+    }}; }\n`,
+  });
+  install(root, {
+    id: 'opsle.model-tool',
+    defaultEnabled: true,
+    hooks: [{ name: 'analysis.run', role: 'authority', execution: 'model-backed', failure: 'required' }],
+    source: `export function createCapability({manifest}) { return {async invoke(hook,payload,invocation) {
+      const request={schema:'opsle.model-request.v1',phase:'PLAN',purpose:'inspect',prompt:'bounded'};
+      const output=manifest.hooks.find(item=>item.name===hook).outputSchema;
+      if (!invocation.model.authorization) return {schema:'${CAPABILITY_RESULT_SCHEMA}',capability:manifest.id,hook,output_schema:output,status:'needs-intelligence',value:null,intelligence_request:request,receipts:[],events:[]};
+      const value=await invocation.model.invoke(request);
+      return {schema:'${CAPABILITY_RESULT_SCHEMA}',capability:manifest.id,hook,output_schema:output,status:'ok',value:{schema:output,response:value},receipts:[],events:[]};
+    }}; }\n`,
+  });
+  const authorizations = new WeakSet();
+  const options = runtimeOptions(root, selection());
+  options.model = {
+    availability: () => ({ 'future-provider': true }),
+    authorize: () => { const value = Object.freeze({ schema: 'opsle.model-authorization.v1' }); authorizations.add(value); return value; },
+    invoke: async (authorization, request) => {
+      assert.ok(authorizations.has(authorization));
+      return { schema: 'opsle.model-response.v1', provider: 'future-provider', request };
+    },
+    revoke: authorization => authorizations.delete(authorization),
+  };
+  const runtime = await createCapabilityRuntime(options);
+  const value = await runtime.authority('analysis.run', {
+    schema: 'opsle.test.input.v1',
+  });
+  assert.equal(value.schema, 'opsle.test.output.v1');
+  assert.equal(value.response.schema, 'opsle.model-response.v1');
+  assert.equal(value.response.provider, 'future-provider');
+});
+
+test('ordering is declared by capabilities and cycles fail closed', async t => {
+  const root = temporary(t);
+  const observer = id => `import {appendFileSync} from 'node:fs';
+export function createCapability({manifest}) { return {invoke(hook,payload) { appendFileSync(payload.audit, manifest.id+'\\n'); return {schema:'${CAPABILITY_RESULT_SCHEMA}',capability:manifest.id,hook,output_schema:manifest.hooks.find(item=>item.name===hook).outputSchema,status:'ok',value:null,receipts:[],events:[]}; }}; }\n`;
+  install(root, { id: 'opsle.first', defaultEnabled: true,
+    hooks: [{ name: 'execution.observe', role: 'observer', execution: 'deterministic', failure: 'required', before: ['opsle.second'] }],
+    source: observer('opsle.first') });
+  install(root, { id: 'opsle.second', defaultEnabled: true,
+    hooks: [{ name: 'execution.observe', role: 'observer', execution: 'deterministic', failure: 'required', after: ['opsle.first'] }],
+    source: observer('opsle.second') });
+  const audit = resolve(root, 'order.log');
+  const runtime = await createCapabilityRuntime(runtimeOptions(root, selection()));
+  await runtime.invoke('execution.observe', { schema: 'opsle.test.input.v1', audit });
+  assert.deepEqual(readFileSync(audit, 'utf8').trim().split('\n'), ['opsle.first', 'opsle.second']);
+
+  const cycleRoot = resolve(root, 'cycle');
+  mkdirSync(cycleRoot);
+  install(cycleRoot, { id: 'opsle.cycle-a', defaultEnabled: true,
+    hooks: [{ name: 'execution.observe', role: 'observer', execution: 'deterministic', failure: 'required', after: ['opsle.cycle-b'] }] });
+  install(cycleRoot, { id: 'opsle.cycle-b', defaultEnabled: true,
+    hooks: [{ name: 'execution.observe', role: 'observer', execution: 'deterministic', failure: 'required', after: ['opsle.cycle-a'] }] });
+  const cyclic = await createCapabilityRuntime(runtimeOptions(cycleRoot, selection()));
+  await assert.rejects(cyclic.invoke('execution.observe', {
+    schema: 'opsle.test.input.v1',
+  }), /ordering cycle/);
+});
+
+test('required health and dependencies fail closed while advisory failures are recorded', async t => {
+  const root = temporary(t);
+  const unhealthy = `export function createCapability({manifest}) { return {
+    health() { return {available:false,detail:'fixture unavailable'}; },
+    invoke() { throw new Error('must not run'); }
+  }; }\n`;
+  install(root, { id: 'opsle.required', defaultEnabled: true, source: unhealthy });
+  const runtime = await createCapabilityRuntime(runtimeOptions(root, selection()));
+  await assert.rejects(runtime.authority('example.run', {
+    schema: 'opsle.test.input.v1',
+  }), /fixture unavailable/);
+
+  const missingRoot = resolve(root, 'missing');
+  mkdirSync(missingRoot);
+  install(missingRoot, { id: 'opsle.dependent', defaultEnabled: true,
+    requires: ['opsle.not-installed'] });
+  await assert.rejects(createCapabilityRuntime(runtimeOptions(missingRoot, selection())),
+    /requires enabled capability/);
+
+  const advisoryRoot = resolve(root, 'advisory');
+  mkdirSync(advisoryRoot);
+  install(advisoryRoot, { id: 'opsle.advisory', defaultEnabled: true,
+    hooks: [{ name: 'execution.observe', role: 'observer', execution: 'model-backed', failure: 'advisory' }],
+    source: `export function createCapability() { return {invoke() { throw new Error('fixture failure'); }}; }\n` });
+  const events = [];
+  const advisory = await createCapabilityRuntime(runtimeOptions(advisoryRoot, selection(), events));
+  await advisory.invoke('execution.observe', { schema: 'opsle.test.input.v1' });
+  const event = JSON.parse(events.find(item => item.kind === 'CAPABILITY').message);
+  assert.equal(event.status, 'failed');
+  assert.equal(event.execution, 'model-backed');
+  assert.equal(event.failure, 'advisory');
+});
+
+test('repository capability selection is read from the immutable base revision', t => {
+  const root = temporary(t);
+  const repository = resolve(root, 'repository');
+  mkdirSync(resolve(repository, '.opsle'), { recursive: true });
+  const baseSelection = {
+    schema: CAPABILITY_SELECTION_SCHEMA,
+    enable: ['opsle.future-tool'],
+    disable: [],
+    configuration: {},
+  };
+  writeFileSync(resolve(repository, '.opsle/capabilities.json'), `${JSON.stringify(baseSelection)}\n`);
+  execFileSync('git', ['init', '-b', 'main'], { cwd: repository });
+  execFileSync('git', ['add', '.'], { cwd: repository });
+  execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+    'commit', '-m', 'base selection'], { cwd: repository });
+  const base = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repository, encoding: 'utf8' }).trim();
+  writeFileSync(resolve(repository, '.opsle/capabilities.json'), `${JSON.stringify({
+    ...baseSelection, enable: [], disable: ['opsle.future-tool'],
+  })}\n`);
+  const read = readRepositoryCapabilitySelection({ logsDir: root }, {
+    repo_path: repository,
+    worktree_path: repository,
+    base_commit: base,
+  });
+  assert.deepEqual(read.enable, ['opsle.future-tool']);
+  assert.deepEqual(read.disable, []);
+});
+
+test('repository selection cannot redirect capability executable paths', async t => {
+  const root = temporary(t);
+  install(root, {
+    id: 'opsle.configured',
+    defaultEnabled: true,
+    configurationSchema: 'opsle.configured.tasks-config.v1',
+    configuration: {
+      repository: { type: 'path', default: '.', required: true },
+      mode: { type: 'string', environment: 'OPSLE_CONFIGURED_MODE',
+        default: 'bounded', project_configurable: true },
+    },
+  });
+  await assert.rejects(createCapabilityRuntime(runtimeOptions(root, selection({
+    configuration: { 'opsle.configured': {
+      schema: 'opsle.configured.tasks-config.v1', repository: '/tmp/untrusted',
+    } },
+  }))), /operator-controlled: repository/);
+  const runtime = await createCapabilityRuntime(runtimeOptions(root, selection({
+    configuration: { 'opsle.configured': {
+      schema: 'opsle.configured.tasks-config.v1', mode: 'focused',
+    } },
+  })));
+  assert.equal(runtime.environment.OPSLE_CONFIGURED_MODE, 'focused');
+});
+
+test('repository selection stays inside the operator grant envelope', async t => {
+  const root = temporary(t);
+  install(root, { id: 'opsle.ungranted',
+    hooks: [{ name: 'example.run', role: 'observer', execution: 'deterministic', failure: 'advisory' }] });
+  await assert.rejects(createCapabilityRuntime(runtimeOptions(root,
+    selection({ enable: ['opsle.ungranted'] }))), /outside its operator grant/);
+  await assert.rejects(createCapabilityRuntime(runtimeOptions(root,
+    selection({ configuration: { 'opsle.ungranted': { mode: 'hostile' } } }))),
+  /outside its operator grant/);
+
+  const granted = await createCapabilityRuntime(runtimeOptions(root,
+    selection({ enable: ['opsle.ungranted'] }), [], ['opsle.ungranted']));
+  assert.deepEqual(granted.manifests.map(item => item.id), ['opsle.ungranted']);
+  assert.throws(() => validateCapabilitySelection({
+    schema: CAPABILITY_SELECTION_SCHEMA,
+    enable: [], disable: [], configuration: {},
+    role: 'authority', failure: 'required', adapter: '/tmp/hostile',
+  }), /forbidden fields/);
+  assert.throws(() => validateCapabilityGrants('{'), /not valid JSON/);
+  assert.throws(() => validateCapabilityGrants({
+    schema: CAPABILITY_GRANTS_SCHEMA, allow: [], role: 'authority',
+  }), /unsupported schema/);
+
+  const authorityRoot = temporary(t);
+  install(authorityRoot, { id: 'opsle.operator-authority' });
+  await assert.rejects(createCapabilityRuntime(runtimeOptions(authorityRoot,
+    selection({ enable: ['opsle.operator-authority'] }), [], ['opsle.operator-authority'])),
+  /authority ownership is operator-controlled/);
+  const operatorEnabled = await createCapabilityRuntime(runtimeOptions(
+    authorityRoot, selection(), [], ['opsle.operator-authority']));
+  assert.deepEqual(operatorEnabled.manifests.map(item => item.id),
+    ['opsle.operator-authority']);
+  await assert.rejects(createCapabilityRuntime(runtimeOptions(authorityRoot,
+    selection({ disable: ['opsle.operator-authority'] }), [], ['opsle.operator-authority'])),
+  /authority ownership is operator-controlled/);
+});
+
+test('deterministic hooks and model metadata alone cannot authorize intelligence', async t => {
+  const deterministicRoot = temporary(t);
+  install(deterministicRoot, {
+    id: 'opsle.deterministic-model-attempt',
+    defaultEnabled: true,
+    source: `export function createCapability({manifest,services}) { return {async invoke(hook,payload,invocation) {
+      await assertDenied(services.model); await assertDenied(invocation.model);
+      return {schema:'${CAPABILITY_RESULT_SCHEMA}',capability:manifest.id,hook,output_schema:'opsle.test.output.v1',status:'needs-intelligence',value:null,intelligence_request:{schema:'opsle.model-request.v1',phase:'PLAN',purpose:'metadata-is-not-authority',prompt:'deny'},receipts:[],events:[]};
+    }}; }
+    async function assertDenied(model) { try { await model.invoke({}); } catch (error) { if (/no Gearbox authorization/.test(error.message)) return; throw error; } throw new Error('model access was exposed'); }\n`,
+  });
+  const deterministic = await createCapabilityRuntime(runtimeOptions(
+    deterministicRoot, selection()));
+  await assert.rejects(deterministic.authority('example.run', {
+    schema: 'opsle.test.input.v1',
+  }), /Deterministic capability .* cannot request model intelligence/);
+
+  const modelRoot = temporary(t);
+  install(modelRoot, {
+    id: 'opsle.metadata-only',
+    defaultEnabled: true,
+    hooks: [{ name: 'analysis.run', role: 'authority', execution: 'model-backed', failure: 'required' }],
+    source: `export function createCapability({manifest,services}) { return {async invoke(hook,payload,invocation) {
+      if ('authorization' in invocation.model) throw new Error('metadata authorized model access');
+      try { await services.model.invoke({}); } catch (error) { if (!/no Gearbox authorization/.test(error.message)) throw error; }
+      return {schema:'${CAPABILITY_RESULT_SCHEMA}',capability:manifest.id,hook,output_schema:'opsle.test.output.v1',status:'ok',value:{schema:'opsle.test.output.v1'},receipts:[],events:[]};
+    }}; }\n`,
+  });
+  const metadataOnly = await createCapabilityRuntime(runtimeOptions(modelRoot, selection()));
+  const value = await metadataOnly.authority('analysis.run', { schema: 'opsle.test.input.v1' });
+  assert.equal(value.schema, 'opsle.test.output.v1');
+});
+
+test('model-backed intelligence request fails without a deterministic route authority', async t => {
+  const root = temporary(t);
+  install(root, {
+    id: 'opsle.model-without-route',
+    defaultEnabled: true,
+    hooks: [{ name: 'analysis.run', role: 'authority', execution: 'model-backed', failure: 'required' }],
+    source: `export function createCapability({manifest}) { return {invoke(hook) {
+      return {schema:'${CAPABILITY_RESULT_SCHEMA}',capability:manifest.id,hook,output_schema:'opsle.test.output.v1',status:'needs-intelligence',value:null,intelligence_request:{schema:'opsle.model-request.v1',phase:'PLAN',purpose:'bounded',prompt:'bounded'},receipts:[],events:[]};
+    }}; }\n`,
+  });
+  const options = runtimeOptions(root, selection());
+  options.model = { availability: () => ({ codex: true }), authorize: () => assert.fail(),
+    invoke: () => assert.fail(), revoke: () => assert.fail() };
+  const runtime = await createCapabilityRuntime(options);
+  await assert.rejects(runtime.authority('analysis.run', {
+    schema: 'opsle.test.input.v1',
+  }), /route.select requires exactly one enabled authority; found 0/);
+});
+
+test('capability API exposes no provider executor and detects installation mutation', async t => {
+  const root = temporary(t);
+  const installed = install(root, {
+    id: 'opsle.api-boundary',
+    defaultEnabled: true,
+    source: `export function createCapability({manifest,services}) { return {invoke(hook,payload,invocation) {
+      for (const key of ['provider','runProvider','execProvider','capabilities','invokeCapability','runtime']) if (key in services || key in invocation) throw new Error('privileged executor exposed');
+      if ('config' in services) throw new Error('raw substrate configuration exposed');
+      return {schema:'${CAPABILITY_RESULT_SCHEMA}',capability:manifest.id,hook,output_schema:'opsle.test.output.v1',status:'ok',value:{schema:'opsle.test.output.v1'},receipts:[],events:[]};
+    }}; }\n`,
+  });
+  const runtime = await createCapabilityRuntime(runtimeOptions(root, selection()));
+  await runtime.authority('example.run', { schema: 'opsle.test.input.v1' });
+  writeFileSync(resolve(installed, 'adapter.mjs'), `${resultSource}\n// changed after discovery\n`);
+  await assert.rejects(runtime.authority('example.run', {
+    schema: 'opsle.test.input.v1',
+  }), /installation changed after trusted discovery/);
+
+  const manifestRoot = temporary(t);
+  const manifestInstall = install(manifestRoot, {
+    id: 'opsle.manifest-mutation', defaultEnabled: true,
+  });
+  const manifestRuntime = await createCapabilityRuntime(runtimeOptions(
+    manifestRoot, selection()));
+  const manifestPath = resolve(manifestInstall, 'opsle-capability.json');
+  writeFileSync(manifestPath, `${readFileSync(manifestPath, 'utf8')} `);
+  await assert.rejects(manifestRuntime.authority('example.run', {
+    schema: 'opsle.test.input.v1',
+  }), /installation changed after trusted discovery/);
+});
+
+test('unsupported manifests and duplicate identities are rejected before execution', t => {
+  const root = temporary(t);
+  const first = install(root, { id: 'opsle.duplicate', directory: 'one' });
+  install(root, { id: 'opsle.duplicate', directory: 'two' });
+  assert.throws(() => discoverCapabilities({ root: tasksRoot, capabilityRoots: [root] }),
+    /Duplicate enabled capability identity/);
+  rmSync(first, { recursive: true });
+  const path = resolve(root, 'two', 'opsle-capability.json');
+  const manifest = JSON.parse(readFileSync(path, 'utf8'));
+  manifest.schema = 'opsle.capability-manifest.v2';
+  writeFileSync(path, JSON.stringify(manifest));
+  assert.throws(() => discoverCapabilities({ root: tasksRoot, capabilityRoots: [root] }),
+    /unsupported schema/);
+
+  const routeRoot = temporary(t);
+  install(routeRoot, { id: 'opsle.model-router', hooks: [{
+    name: 'route.select', role: 'authority', execution: 'model-backed', failure: 'required',
+  }] });
+  assert.throws(() => discoverCapabilities({ root: tasksRoot,
+    capabilityRoots: [routeRoot] }), /route authority must be deterministic/);
+});

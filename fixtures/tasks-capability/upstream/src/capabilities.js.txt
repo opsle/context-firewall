@@ -1,0 +1,708 @@
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+} from 'node:fs';
+import { createHash } from 'node:crypto';
+import { delimiter, dirname, isAbsolute, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { executionTarget, projectGit } from './execution.js';
+import { validateModelRequest } from './model-gateway.js';
+import { providerMetadata } from './provider-metadata.js';
+
+export const CAPABILITY_MANIFEST_SCHEMA = 'opsle.capability-manifest.v1';
+export const CAPABILITY_SELECTION_SCHEMA = 'opsle.capability-selection.v1';
+export const CAPABILITY_GRANTS_SCHEMA = 'opsle.capability-grants.v1';
+export const CAPABILITY_RESULT_SCHEMA = 'opsle.capability-result.v1';
+
+const ID = /^[a-z0-9]+(?:[.-][a-z0-9]+)+$/;
+const VERSION = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
+const HOOK = /^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+$/;
+const MAX_MANIFEST_BYTES = 128_000;
+const TASKS_ROOT = resolve(new URL('..', import.meta.url).pathname);
+const EMPTY_SELECTION = Object.freeze({
+  schema: CAPABILITY_SELECTION_SCHEMA,
+  enable: [],
+  disable: [],
+  configuration: {},
+});
+const EMPTY_GRANTS = Object.freeze({
+  schema: CAPABILITY_GRANTS_SCHEMA,
+  allow: [],
+});
+
+const object = value => value && typeof value === 'object' && !Array.isArray(value);
+const strings = (value, label) => {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || !item.trim())) {
+    throw new Error(`${label} must be an array of non-empty strings.`);
+  }
+  return [...new Set(value.map(item => item.trim()))];
+};
+const capabilityIds = (value, label) => {
+  const result = strings(value, label);
+  if (result.some(item => !ID.test(item))) {
+    throw new Error(`${label} must contain capability identifiers.`);
+  }
+  return result;
+};
+
+function readJson(path, label) {
+  const stat = statSync(path);
+  if (!stat.isFile() || stat.size > MAX_MANIFEST_BYTES) {
+    throw new Error(`${label} must be a regular JSON file no larger than ${MAX_MANIFEST_BYTES} bytes.`);
+  }
+  try { return JSON.parse(readFileSync(path, 'utf8')); }
+  catch { throw new Error(`${label} is not valid JSON.`); }
+}
+
+const fileHash = path => `sha256:${createHash('sha256').update(readFileSync(path)).digest('hex')}`;
+
+function validateHook(value, manifestId) {
+  if (!object(value) || !HOOK.test(value.name || '')) {
+    throw new Error(`Capability ${manifestId} has an invalid lifecycle hook.`);
+  }
+  const unknown = Object.keys(value).filter(key => ![
+    'name', 'input_schema', 'output_schema', 'role', 'execution', 'failure', 'before', 'after',
+  ].includes(key));
+  if (unknown.length) throw new Error(`Capability ${manifestId} hook contains unknown fields: ${unknown.join(', ')}.`);
+  const role = value.role || 'observer';
+  const execution = value.execution || 'deterministic';
+  const failure = value.failure || 'advisory';
+  if (typeof value.input_schema !== 'string' || !value.input_schema.trim()
+    || typeof value.output_schema !== 'string' || !value.output_schema.trim()) {
+    throw new Error(`Capability ${manifestId} hook ${value.name} must declare input and output schemas.`);
+  }
+  if (!['authority', 'observer'].includes(role)) {
+    throw new Error(`Capability ${manifestId} hook ${value.name} has an invalid role.`);
+  }
+  if (!['deterministic', 'model-backed'].includes(execution)) {
+    throw new Error(`Capability ${manifestId} hook ${value.name} has an invalid execution mode.`);
+  }
+  if (!['required', 'advisory'].includes(failure)) {
+    throw new Error(`Capability ${manifestId} hook ${value.name} has an invalid failure policy.`);
+  }
+  if (value.name === 'route.select' && role === 'authority'
+    && execution !== 'deterministic') {
+    throw new Error(`Capability ${manifestId} route authority must be deterministic.`);
+  }
+  return {
+    name: value.name,
+    role,
+    execution,
+    failure,
+    inputSchema: value.input_schema,
+    outputSchema: value.output_schema,
+    before: capabilityIds(value.before, `${manifestId}.${value.name}.before`),
+    after: capabilityIds(value.after, `${manifestId}.${value.name}.after`),
+  };
+}
+
+function validateManifest(path) {
+  const value = readJson(path, `Capability manifest ${path}`);
+  if (!object(value) || value.schema !== CAPABILITY_MANIFEST_SCHEMA) {
+    throw new Error(`Capability manifest ${path} uses an unsupported schema.`);
+  }
+  if (!ID.test(value.id || '') || !VERSION.test(value.version || '')
+    || typeof value.name !== 'string' || !value.name.trim()) {
+    throw new Error(`Capability manifest ${path} has an invalid identity or version.`);
+  }
+  const unknownManifestFields = Object.keys(value).filter(key => ![
+    'schema', 'id', 'name', 'version', 'adapter', 'default_enabled',
+    'configuration_schema', 'configuration', 'requires', 'hooks',
+  ].includes(key));
+  if (unknownManifestFields.length) {
+    throw new Error(`Capability manifest ${path} contains unknown fields: ${unknownManifestFields.join(', ')}.`);
+  }
+  if (value.default_enabled !== undefined && typeof value.default_enabled !== 'boolean') {
+    throw new Error(`Capability ${value.id} has an invalid default-enabled policy.`);
+  }
+  if (typeof value.adapter !== 'string' || !value.adapter.trim() || isAbsolute(value.adapter)) {
+    throw new Error(`Capability ${value.id} must declare a relative adapter path.`);
+  }
+  if (!Array.isArray(value.hooks) || value.hooks.length === 0) {
+    throw new Error(`Capability ${value.id} must declare at least one lifecycle hook.`);
+  }
+  const directory = dirname(path);
+  const adapterPath = resolve(directory, value.adapter);
+  const realDirectory = realpathSync(directory);
+  const realAdapter = realpathSync(adapterPath);
+  if (!statSync(realAdapter).isFile()) {
+    throw new Error(`Capability ${value.id} adapter must be a regular file.`);
+  }
+  if (realAdapter !== realDirectory && !realAdapter.startsWith(`${realDirectory}/`)) {
+    throw new Error(`Capability ${value.id} adapter escapes its installation directory.`);
+  }
+  const configuration = value.configuration === undefined ? {} : value.configuration;
+  if (!object(configuration)) throw new Error(`Capability ${value.id} configuration must be an object.`);
+  if (value.configuration_schema !== undefined
+    && (typeof value.configuration_schema !== 'string' || !value.configuration_schema.trim())) {
+    throw new Error(`Capability ${value.id} has an invalid configuration schema.`);
+  }
+  for (const [key, descriptor] of Object.entries(configuration)) {
+    if (!/^[a-z][a-zA-Z0-9]*$/.test(key) || !object(descriptor)
+      || !['string', 'path', 'integer', 'boolean'].includes(descriptor.type)) {
+      throw new Error(`Capability ${value.id} has an invalid configuration descriptor for ${key}.`);
+    }
+    const unknownDescriptorFields = Object.keys(descriptor).filter(field => ![
+      'type', 'environment', 'legacy_config', 'default', 'base', 'required',
+      'project_configurable',
+    ].includes(field));
+    if (unknownDescriptorFields.length) {
+      throw new Error(`Capability ${value.id} configuration ${key} contains unknown fields: ${unknownDescriptorFields.join(', ')}.`);
+    }
+    if (descriptor.environment !== undefined
+      && !/^[A-Z_][A-Z0-9_]*$/.test(descriptor.environment)) {
+      throw new Error(`Capability ${value.id} has an invalid environment binding for ${key}.`);
+    }
+    if (descriptor.base !== undefined && !['manifest', 'tasks-root'].includes(descriptor.base)) {
+      throw new Error(`Capability ${value.id} has an invalid path base for ${key}.`);
+    }
+    if (descriptor.project_configurable !== undefined
+      && typeof descriptor.project_configurable !== 'boolean') {
+      throw new Error(`Capability ${value.id} has an invalid project configuration policy for ${key}.`);
+    }
+    if (descriptor.type === 'path' && descriptor.project_configurable === true) {
+      throw new Error(`Capability ${value.id} cannot make executable path configuration project-controlled.`);
+    }
+  }
+  const hooks = value.hooks.map(hook => validateHook(hook, value.id));
+  if (new Set(hooks.map(hook => hook.name)).size !== hooks.length) {
+    throw new Error(`Capability ${value.id} declares a lifecycle hook more than once.`);
+  }
+  return Object.freeze({
+    schema: value.schema,
+    id: value.id,
+    name: value.name.trim(),
+    version: value.version,
+    adapterPath: realAdapter,
+    adapterSha256: fileHash(realAdapter),
+    manifestPath: realpathSync(path),
+    manifestSha256: fileHash(realpathSync(path)),
+    directory: realDirectory,
+    defaultEnabled: value.default_enabled === true,
+    configurationSchema: value.configuration_schema || null,
+    configuration,
+    requires: capabilityIds(value.requires, `${value.id}.requires`),
+    hooks,
+  });
+}
+
+function configuredRoots(config) {
+  if (Array.isArray(config.capabilityRoots) && config.capabilityRoots.length) {
+    return config.capabilityRoots.map(path => resolve(path));
+  }
+  const configured = process.env.OPSLE_CAPABILITY_PATH;
+  if (configured) return configured.split(delimiter).filter(Boolean).map(path => resolve(path));
+  return [resolve(config.root || TASKS_ROOT, 'capabilities')];
+}
+
+export function discoverCapabilities(config) {
+  const manifests = [];
+  for (const root of configuredRoots(config)) {
+    if (!existsSync(root)) continue;
+    const candidates = [];
+    if (statSync(root).isFile()) candidates.push(root);
+    else if (statSync(root).isDirectory()) {
+      const direct = resolve(root, 'opsle-capability.json');
+      if (existsSync(direct)) candidates.push(direct);
+      for (const entry of readdirSync(root, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        const candidate = resolve(root, entry.name, 'opsle-capability.json');
+        if (existsSync(candidate)) candidates.push(candidate);
+      }
+    }
+    manifests.push(...candidates.map(validateManifest));
+  }
+  const byId = new Map();
+  for (const manifest of manifests) {
+    if (byId.has(manifest.id)) {
+      throw new Error(`Duplicate enabled capability identity: ${manifest.id}.`);
+    }
+    byId.set(manifest.id, manifest);
+  }
+  return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+export function validateCapabilitySelection(value, source = 'Capability selection') {
+  if (value === null || value === undefined) return EMPTY_SELECTION;
+  if (!object(value) || value.schema !== CAPABILITY_SELECTION_SCHEMA) {
+    throw new Error(`${source} uses an unsupported schema.`);
+  }
+  const unknownFields = Object.keys(value)
+    .filter(key => !['schema', 'enable', 'disable', 'configuration'].includes(key));
+  if (unknownFields.length) throw new Error(`${source} contains forbidden fields: ${unknownFields.join(', ')}.`);
+  const configuration = value.configuration === undefined ? {} : value.configuration;
+  if (!object(configuration) || Object.values(configuration).some(item => !object(item))) {
+    throw new Error(`${source} configuration must map capability IDs to objects.`);
+  }
+  const enable = capabilityIds(value.enable, `${source}.enable`);
+  const disable = capabilityIds(value.disable, `${source}.disable`);
+  const overlap = enable.filter(id => disable.includes(id));
+  if (overlap.length) throw new Error(`${source} cannot both enable and disable: ${overlap.join(', ')}.`);
+  capabilityIds(Object.keys(configuration), `${source}.configuration`);
+  return Object.freeze({
+    schema: value.schema,
+    enable,
+    disable,
+    configuration,
+  });
+}
+
+export function validateCapabilityGrants(value, source = 'Project capability grants') {
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value); }
+    catch { throw new Error(`${source} is not valid JSON.`); }
+  }
+  if (value === null || value === undefined || value === '') return EMPTY_GRANTS;
+  if (!object(value) || value.schema !== CAPABILITY_GRANTS_SCHEMA
+    || Object.keys(value).some(key => !['schema', 'allow'].includes(key))) {
+    throw new Error(`${source} uses an unsupported schema.`);
+  }
+  return Object.freeze({
+    schema: CAPABILITY_GRANTS_SCHEMA,
+    allow: capabilityIds(value.allow, `${source}.allow`),
+  });
+}
+
+export function readRepositoryCapabilitySelection(config, task) {
+  if (task.capability_selection) {
+    return validateCapabilitySelection(task.capability_selection, 'Execution capability selection');
+  }
+  if (!task.base_commit) return EMPTY_SELECTION;
+  const target = executionTarget(task);
+  const result = projectGit(config, target, [
+    'show', `${task.base_commit}:.opsle/capabilities.json`,
+  ], task.worktree_path || target.path, { allowFailure: true });
+  if (result.status !== 0) return EMPTY_SELECTION;
+  let parsed;
+  try { parsed = JSON.parse(result.stdout); }
+  catch { throw new Error('Repository .opsle/capabilities.json is not valid JSON.'); }
+  return validateCapabilitySelection(parsed, 'Repository .opsle/capabilities.json');
+}
+
+function settingValue(descriptor, manifest, config, override) {
+  let value = override;
+  if (value === undefined && descriptor.legacy_config
+    && Object.hasOwn(config, descriptor.legacy_config)) value = config[descriptor.legacy_config];
+  if (value === undefined && descriptor.environment
+    && Object.hasOwn(process.env, descriptor.environment)) value = process.env[descriptor.environment];
+  if (value === undefined) value = descriptor.default;
+  if (descriptor.required && (value === undefined || value === null || value === '')) {
+    throw new Error(`Capability ${manifest.id} requires configuration ${descriptor.environment || 'value'}.`);
+  }
+  if (value === undefined) return value;
+  if (descriptor.type === 'boolean') {
+    if (typeof value === 'boolean') return value;
+    if (value === 'true' || value === '1') return true;
+    if (value === 'false' || value === '0') return false;
+    throw new Error(`Capability ${manifest.id} configuration must be boolean.`);
+  }
+  if (descriptor.type === 'integer') {
+    const number = typeof value === 'number' ? value : Number.parseInt(value, 10);
+    if (!Number.isSafeInteger(number)) throw new Error(`Capability ${manifest.id} configuration must be an integer.`);
+    return number;
+  }
+  if (typeof value !== 'string') throw new Error(`Capability ${manifest.id} configuration must be a string.`);
+  if (descriptor.type !== 'path') return value;
+  const base = descriptor.base === 'tasks-root' ? (config.root || TASKS_ROOT) : manifest.directory;
+  return resolve(base, value);
+}
+
+function resolveConfiguration(manifest, config, selection) {
+  const supplied = selection.configuration[manifest.id] || {};
+  if (manifest.configurationSchema && Object.keys(supplied).length
+    && supplied.schema !== manifest.configurationSchema) {
+    throw new Error(`Capability ${manifest.id} configuration uses an unsupported schema.`);
+  }
+  const allowed = new Set([...Object.keys(manifest.configuration), 'schema']);
+  const unknown = Object.keys(supplied).filter(key => !allowed.has(key));
+  if (unknown.length) throw new Error(`Capability ${manifest.id} has unknown configuration: ${unknown.join(', ')}.`);
+  const protectedSettings = Object.keys(supplied).filter(key => key !== 'schema'
+    && manifest.configuration[key]?.project_configurable !== true);
+  if (protectedSettings.length) {
+    throw new Error(`Capability ${manifest.id} configuration is operator-controlled: ${protectedSettings.join(', ')}.`);
+  }
+  return Object.fromEntries(Object.entries(manifest.configuration).map(([key, descriptor]) => [
+    key, settingValue(descriptor, manifest, config, supplied[key]),
+  ]));
+}
+
+function environmentFor(manifests, configurations) {
+  const environment = {};
+  for (const manifest of manifests) {
+    const resolved = configurations.get(manifest.id);
+    for (const [key, descriptor] of Object.entries(manifest.configuration)) {
+      if (!descriptor.environment || resolved[key] === undefined) continue;
+      environment[descriptor.environment] = String(resolved[key]);
+    }
+  }
+  return environment;
+}
+
+function enabledManifests(manifests, selection, grants = EMPTY_GRANTS) {
+  const known = new Set(manifests.map(manifest => manifest.id));
+  const missing = selection.enable.filter(id => !known.has(id));
+  if (missing.length) throw new Error(`Enabled capability is not installed: ${missing.join(', ')}.`);
+  const granted = new Set(manifests.filter(item => item.defaultEnabled).map(item => item.id));
+  for (const id of grants.allow) if (known.has(id)) granted.add(id);
+  const authorityIds = new Set(manifests
+    .filter(manifest => manifest.hooks.some(hook => hook.role === 'authority'))
+    .map(manifest => manifest.id));
+  const repositoryAuthorityChanges = [...selection.enable, ...selection.disable]
+    .filter(id => authorityIds.has(id));
+  if (repositoryAuthorityChanges.length) {
+    throw new Error(`Capability authority ownership is operator-controlled: ${[...new Set(repositoryAuthorityChanges)].join(', ')}.`);
+  }
+  const unauthorized = selection.enable.filter(id => !granted.has(id));
+  if (unauthorized.length) {
+    throw new Error(`Repository requested capability outside its operator grant: ${unauthorized.join(', ')}.`);
+  }
+  const enabled = new Set(manifests.filter(item => item.defaultEnabled).map(item => item.id));
+  // A project grant activates authorities; repository content cannot choose authority ownership.
+  for (const id of grants.allow) if (authorityIds.has(id) && known.has(id)) enabled.add(id);
+  for (const id of selection.enable) enabled.add(id);
+  for (const id of selection.disable) enabled.delete(id);
+  const configured = Object.keys(selection.configuration);
+  const ungrantedConfiguration = configured.filter(id => !granted.has(id));
+  if (ungrantedConfiguration.length) {
+    throw new Error(`Repository configured capability outside its operator grant: ${ungrantedConfiguration.join(', ')}.`);
+  }
+  const inactiveConfiguration = configured.filter(id => !enabled.has(id));
+  if (inactiveConfiguration.length) {
+    throw new Error(`Repository configured a disabled capability: ${inactiveConfiguration.join(', ')}.`);
+  }
+  const selected = manifests.filter(item => enabled.has(item.id));
+  const selectedIds = new Set(selected.map(item => item.id));
+  for (const manifest of selected) {
+    const missingRequirements = manifest.requires.filter(id => !selectedIds.has(id));
+    if (missingRequirements.length) {
+      throw new Error(`Capability ${manifest.id} requires enabled capability ${missingRequirements.join(', ')}.`);
+    }
+  }
+  return selected;
+}
+
+export function capabilityEnvironment(config, selection = EMPTY_SELECTION) {
+  const manifests = enabledManifests(discoverCapabilities(config), selection);
+  const configurations = new Map(manifests.map(manifest => [
+    manifest.id, resolveConfiguration(manifest, config, selection),
+  ]));
+  return environmentFor(manifests, configurations);
+}
+
+export function selectedCapabilities(config, task) {
+  return enabledManifests(discoverCapabilities(config),
+    readRepositoryCapabilitySelection(config, task),
+    validateCapabilityGrants(task.capability_grants || task.capability_grants_json));
+}
+
+function verifyInstalledBytes(manifest) {
+  if (fileHash(manifest.manifestPath) !== manifest.manifestSha256
+    || fileHash(manifest.adapterPath) !== manifest.adapterSha256) {
+    throw new Error(`Capability ${manifest.id} installation changed after trusted discovery.`);
+  }
+}
+
+function orderForHook(instances, hookName) {
+  const applicable = instances.filter(instance => instance.manifest.hooks.some(hook => hook.name === hookName));
+  const byId = new Map(applicable.map(instance => [instance.manifest.id, instance]));
+  const incoming = new Map(applicable.map(instance => [instance.manifest.id, new Set()]));
+  for (const instance of applicable) {
+    const hook = instance.manifest.hooks.find(item => item.name === hookName);
+    for (const id of hook.after) if (byId.has(id)) incoming.get(instance.manifest.id).add(id);
+    for (const id of hook.before) if (byId.has(id)) incoming.get(id).add(instance.manifest.id);
+  }
+  const ordered = [];
+  while (ordered.length < applicable.length) {
+    const ready = applicable.filter(instance => !ordered.includes(instance)
+      && incoming.get(instance.manifest.id).size === 0)
+      .sort((a, b) => a.manifest.id.localeCompare(b.manifest.id));
+    if (!ready.length) throw new Error(`Capability ordering cycle at lifecycle hook ${hookName}.`);
+    for (const instance of ready) {
+      ordered.push(instance);
+      for (const dependencies of incoming.values()) dependencies.delete(instance.manifest.id);
+    }
+  }
+  return ordered;
+}
+
+function validateResult(instance, hook, result, intelligenceRequestAllowed = false) {
+  if (!object(result) || result.schema !== CAPABILITY_RESULT_SCHEMA
+    || result.capability !== instance.manifest.id || result.hook !== hook.name
+    || result.output_schema !== hook.outputSchema
+    || !['ok', 'skipped', 'needs-intelligence'].includes(result.status)) {
+    throw new Error(`Capability ${instance.manifest.id} returned an invalid result for ${hook.name}.`);
+  }
+  if (result.status === 'needs-intelligence') {
+    if (hook.execution !== 'model-backed') {
+      throw new Error(`Deterministic capability ${instance.manifest.id} cannot request model intelligence.`);
+    }
+    if (!intelligenceRequestAllowed
+      || result.value !== null || result.receipts?.length || result.events?.length
+      || result.artifacts?.length) {
+      throw new Error(`Capability ${instance.manifest.id} returned an invalid intelligence request for ${hook.name}.`);
+    }
+    validateModelRequest(result.intelligence_request);
+    return result;
+  }
+  if (result.intelligence_request !== undefined) {
+    throw new Error(`Capability ${instance.manifest.id} returned unexpected intelligence metadata for ${hook.name}.`);
+  }
+  if (result.receipts !== undefined && !Array.isArray(result.receipts)) {
+    throw new Error(`Capability ${instance.manifest.id} returned invalid receipts.`);
+  }
+  if (result.events !== undefined && (!Array.isArray(result.events)
+    || result.events.some(event => !object(event) || typeof event.kind !== 'string'
+      || typeof event.message !== 'string'))) {
+    throw new Error(`Capability ${instance.manifest.id} returned invalid events.`);
+  }
+  if (result.artifacts !== undefined && (!Array.isArray(result.artifacts)
+    || result.artifacts.some(artifact => !object(artifact)
+      || typeof artifact.kind !== 'string' || !artifact.kind
+      || typeof artifact.path !== 'string' || !artifact.path
+      || typeof artifact.schema !== 'string' || !artifact.schema))) {
+    throw new Error(`Capability ${instance.manifest.id} returned invalid artifacts.`);
+  }
+  if (hook.role === 'authority'
+    && (!object(result.value) || result.value.schema !== hook.outputSchema)) {
+    throw new Error(`Capability ${instance.manifest.id} returned a value outside ${hook.outputSchema}.`);
+  }
+  if (hook.role === 'observer' && result.value !== null && result.value !== undefined
+    && (!object(result.value) || result.value.schema !== hook.outputSchema)) {
+    throw new Error(`Capability ${instance.manifest.id} returned a value outside ${hook.outputSchema}.`);
+  }
+  return result;
+}
+
+function recordArtifacts(instance, hook, artifacts, config, emitEvent) {
+  for (const artifact of artifacts || []) {
+    const path = realpathSync(artifact.path);
+    const logs = realpathSync(config.logsDir);
+    const stat = statSync(path);
+    if (!stat.isFile() || dirname(path) !== logs || stat.size > 5_000_000) {
+      throw new Error(`Capability ${instance.manifest.id} returned an unsafe artifact path.`);
+    }
+    const digest = `sha256:${createHash('sha256').update(readFileSync(path)).digest('hex')}`;
+    emitEvent('CAPABILITY_ARTIFACT', JSON.stringify({
+      capability: instance.manifest.id,
+      capability_version: instance.manifest.version,
+      implementation: instance.manifest.adapterSha256,
+      manifest_implementation: instance.manifest.manifestSha256,
+      hook: hook.name,
+      kind: artifact.kind,
+      schema: artifact.schema,
+      path,
+      sha256: digest,
+      bytes: stat.size,
+    }));
+  }
+}
+
+export function capabilityExecutionConfig(config) {
+  return Object.freeze({
+    commandTimeoutSeconds: config.commandTimeoutSeconds,
+    logsDir: config.logsDir,
+    sshBin: config.sshBin,
+    sshKeyPath: config.sshKeyPath,
+    sshKnownHostsPath: config.sshKnownHostsPath,
+    sudoBin: config.sudoBin,
+    localExecBin: config.localExecBin,
+  });
+}
+
+export async function createCapabilityRuntime({
+  config,
+  task,
+  attemptId,
+  executionId,
+  store,
+  model = null,
+  selection = readRepositoryCapabilitySelection(config, task),
+  emitEvent = (kind, message) => store?.addEvent?.(task.id, kind, message),
+}) {
+  const manifests = discoverCapabilities(config);
+  const grants = validateCapabilityGrants(task.capability_grants || task.capability_grants_json);
+  const selected = enabledManifests(manifests, selection, grants);
+  const instances = [];
+  const executionConfig = capabilityExecutionConfig(config);
+  for (const manifest of selected) {
+    verifyInstalledBytes(manifest);
+    const module = await import(pathToFileURL(manifest.adapterPath));
+    if (typeof module.createCapability !== 'function') {
+      throw new Error(`Capability ${manifest.id} adapter does not export createCapability().`);
+    }
+    const configuration = resolveConfiguration(manifest, config, selection);
+    const deniedModel = Object.freeze({
+      invoke: async () => { throw new Error('Model invocation denied: no Gearbox authorization for this capability invocation.'); },
+    });
+    const adapter = await module.createCapability({
+      manifest,
+      configuration,
+      services: Object.freeze({
+        task,
+        attemptId,
+        executionId,
+        logsDir: config.logsDir,
+        executionConfig,
+        providerMetadata: provider => providerMetadata(provider, config),
+        model: deniedModel,
+      }),
+    });
+    if (!adapter || typeof adapter.invoke !== 'function') {
+      throw new Error(`Capability ${manifest.id} adapter is invalid.`);
+    }
+    let health = { available: true, detail: null };
+    if (typeof adapter.health === 'function') health = await adapter.health();
+    if (!object(health) || typeof health.available !== 'boolean') {
+      throw new Error(`Capability ${manifest.id} returned invalid health.`);
+    }
+    instances.push({ manifest, adapter, configuration, health });
+  }
+
+  const invoke = async (hookName, payload, {
+    authority = false,
+    recordReceipts = true,
+    intelligenceAllowed = true,
+  } = {}) => {
+    const ordered = orderForHook(instances, hookName);
+    const authorities = ordered.filter(instance => instance.manifest.hooks
+      .find(hook => hook.name === hookName).role === 'authority');
+    if (authority && authorities.length !== 1) {
+      throw new Error(`Lifecycle hook ${hookName} requires exactly one enabled authority; found ${authorities.length}.`);
+    }
+    let authorityResult = null;
+    const results = [];
+    for (const instance of ordered) {
+      const hook = instance.manifest.hooks.find(item => item.name === hookName);
+      if (!object(payload) || payload.schema !== hook.inputSchema) {
+        throw new Error(`Lifecycle hook ${hookName} requires input schema ${hook.inputSchema}.`);
+      }
+      if (!instance.health.available) {
+        const reason = instance.health.detail || 'health check reported unavailable';
+        if (hook.failure === 'required') {
+          const error = new Error(`${instance.manifest.name} is unavailable: ${reason}`);
+          error.code = 'CAPABILITY_UNAVAILABLE';
+          error.owner = { component: instance.manifest.id, sourceRepositoryPath: instance.configuration.repository || null };
+          throw error;
+        }
+        emitEvent('CAPABILITY', JSON.stringify({ id: instance.manifest.id,
+          name: instance.manifest.name, version: instance.manifest.version,
+          implementation: instance.manifest.adapterSha256, hook: hookName,
+          manifest_implementation: instance.manifest.manifestSha256,
+          status: 'unavailable', input_schema: hook.inputSchema,
+          output_schema: hook.outputSchema, execution: hook.execution,
+          failure: hook.failure, detail: reason }));
+        continue;
+      }
+      try {
+        verifyInstalledBytes(instance.manifest);
+        const deniedInvocation = Object.freeze({ model: Object.freeze({
+          invoke: async () => { throw new Error('Model invocation denied: no Gearbox authorization for this capability invocation.'); },
+        }) });
+        let result = validateResult(instance, hook,
+          await instance.adapter.invoke(hookName, payload, deniedInvocation), true);
+        if (result.status === 'needs-intelligence') {
+          if (hook.execution !== 'model-backed') {
+            throw new Error(`Deterministic capability ${instance.manifest.id} cannot request model intelligence.`);
+          }
+          if (!intelligenceAllowed) {
+            throw new Error(`Model intelligence cannot be requested while selecting its Gearbox route.`);
+          }
+          if (typeof model?.availability !== 'function'
+            || typeof model?.authorize !== 'function'
+            || typeof model?.invoke !== 'function'
+            || typeof model?.revoke !== 'function') {
+            throw new Error('Provider-neutral model gateway is unavailable.');
+          }
+          const request = validateModelRequest(result.intelligence_request);
+          const availability = model.availability();
+          const decision = await invoke('route.select', {
+            schema: 'opsle.execution.route-request.v1',
+            phase: request.phase,
+            choice: task.provider_choice || 'auto',
+            availability: { ...availability, deterministic: false },
+          }, { authority: true, intelligenceAllowed: false });
+          const authorization = model.authorize({
+            executionId,
+            capability: instance.manifest.id,
+            hook: hookName,
+            request,
+            decision,
+          });
+          const scope = Object.freeze({
+            executionId,
+            capability: instance.manifest.id,
+            hook: hookName,
+          });
+          const authorizedModel = Object.freeze({
+            authorization,
+            invoke: candidate => model.invoke(authorization, candidate, scope),
+          });
+          emitEvent('MODEL_AUTHORIZATION', JSON.stringify(authorization));
+          verifyInstalledBytes(instance.manifest);
+          try {
+            result = validateResult(instance, hook,
+              await instance.adapter.invoke(hookName, payload,
+                Object.freeze({ model: authorizedModel })), false);
+          } finally {
+            model.revoke(authorization);
+          }
+        }
+        recordArtifacts(instance, hook, result.artifacts, config, emitEvent);
+        emitEvent('CAPABILITY', JSON.stringify({ id: instance.manifest.id, name: instance.manifest.name,
+          version: instance.manifest.version, hook: hookName, status: result.status,
+          implementation: instance.manifest.adapterSha256,
+          manifest_implementation: instance.manifest.manifestSha256,
+          input_schema: hook.inputSchema, output_schema: hook.outputSchema,
+          execution: hook.execution, failure: hook.failure }));
+        for (const event of result.events || []) emitEvent(event.kind, event.message);
+        results.push({ manifest: instance.manifest, hook, result });
+        if (hook.role === 'authority') authorityResult = result;
+        if (recordReceipts && hookName !== 'evidence.receipt' && result.receipts?.length) {
+          for (const receipt of result.receipts) {
+            await invoke('evidence.receipt', {
+              schema: 'opsle.execution.receipt-notification.v1', receipt,
+            }, { recordReceipts: false });
+          }
+        }
+      } catch (error) {
+        emitEvent('CAPABILITY', JSON.stringify({ id: instance.manifest.id, name: instance.manifest.name,
+          version: instance.manifest.version, hook: hookName, status: 'failed',
+          implementation: instance.manifest.adapterSha256,
+          manifest_implementation: instance.manifest.manifestSha256,
+          input_schema: hook.inputSchema, output_schema: hook.outputSchema,
+          execution: hook.execution, failure: hook.failure, detail: String(error.message || error).slice(0, 1000) }));
+        if (hook.failure === 'required') {
+          // Preserve the innermost failing authority (e.g. Gearbox called by a
+          // different capability) rather than assigning the wrapper as owner.
+          error.owner ||= { component: instance.manifest.id, sourceRepositoryPath: instance.configuration.repository || null };
+          error.code ||= 'CAPABILITY_FAILURE';
+          throw error;
+        }
+      }
+    }
+    if (authority && (!authorityResult || authorityResult.status !== 'ok')) {
+      throw new Error(`Lifecycle hook ${hookName} did not produce an authoritative result.`);
+    }
+    return authority ? authorityResult.value : results;
+  };
+
+  return Object.freeze({
+    invoke,
+    authority: (hook, payload, options) => invoke(hook, payload, { ...options, authority: true }),
+    recordReceipt: receipt => invoke('evidence.receipt', {
+      schema: 'opsle.execution.receipt-notification.v1', receipt,
+    }, { recordReceipts: false }),
+    manifests: selected,
+    environment: Object.freeze(environmentFor(selected,
+      new Map(instances.map(instance => [instance.manifest.id, instance.configuration])))),
+    status: selected.map(({ id, name, version, adapterSha256, manifestSha256, hooks }) => ({
+      id, name, version, implementation: adapterSha256,
+      manifestImplementation: manifestSha256,
+      hooks: hooks.map(hook => hook.name), enabled: true,
+    })),
+  });
+}

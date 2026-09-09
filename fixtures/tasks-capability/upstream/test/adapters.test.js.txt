@@ -1,0 +1,165 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { resolve } from 'node:path';
+import { routeWithGearbox } from '../src/adapters/gearbox.js';
+import { reduceWithContextFirewall } from '../src/adapters/context-firewall.js';
+import { createCapability as createContextFirewallCapability }
+  from '../capabilities/context-firewall/adapter.js';
+
+const projectRoot = resolve(new URL('..', import.meta.url).pathname);
+const config = {
+  pythonBin: 'python3',
+  gearboxRepo: resolve(process.env.OPSLE_GEARBOX_REPO || resolve(projectRoot, '..', 'gearbox')),
+  contextFirewallRepo: resolve(process.env.OPSLE_CONTEXT_FIREWALL_REPO || resolve(projectRoot, '..', 'context-firewall')),
+};
+
+test('Opsle Tasks receives provider and deterministic routes from Gearbox', () => {
+  const plan = routeWithGearbox(config, {
+    phase: 'PLAN', choice: 'auto', availability: { codex: true, claude: true, deterministic: false },
+  });
+  const testRoute = routeWithGearbox(config, {
+    phase: 'TEST', choice: 'auto', availability: { codex: true, claude: true, deterministic: true },
+  });
+  assert.equal(plan.route, 'codex');
+  assert.equal(testRoute.route, 'deterministic');
+});
+
+test('Opsle Tasks sends exact command streams to Context Firewall', (t) => {
+  const logsDir = mkdtempSync(resolve(tmpdir(), 'opsle-context-adapter-'));
+  t.after(() => rmSync(logsDir, { recursive: true, force: true }));
+  const reduced = reduceWithContextFirewall({ ...config, logsDir }, {
+    taskId: 9,
+    phase: 'TEST',
+    sourceId: 'fixture',
+    run: {
+      code: 0, durationMs: 12, interrupted: false,
+      stdout: 'TAP version 13\nok 1 - works\n1..1\n# tests 1\n# pass 1\n# fail 0\n# skipped 0\n',
+      stderr: '', stdoutPath: '/tmp/raw.stdout', stderrPath: '/tmp/raw.stderr',
+    },
+  });
+  assert.equal(reduced.packet.protocol_version, 'opsle.context-firewall.evidence-packet/v1');
+  assert.equal(reduced.modelEvidence.protocol_version, 'opsle.context-firewall.model-evidence/v1');
+  assert.deepEqual(reduced.modelEvidence.decision_evidence, reduced.packet.decision_evidence);
+  assert.equal('receipt' in reduced.modelEvidence, false);
+  assert.equal(reduced.packet.decision_evidence.status, 'passed');
+  assert.deepEqual(reduced.valueReceipt.extensions.opsle_tasks_delivery, {
+    schema: 'opsle.tasks.context-firewall-delivery.v2',
+    command_output: 'stored',
+    canonical_packet: 'stored',
+    model_evidence: 'constructed',
+    submission: 'recorded_by_separate_delivery_receipt_when_repair_runs',
+    canonical_packet_bytes: Buffer.byteLength(reduced.packetText, 'utf8'),
+    model_evidence_bytes: Buffer.byteLength(reduced.modelEvidenceText, 'utf8'),
+  });
+  for (const id of ['initial_model_visible_bytes', 'bytes_initially_avoided',
+    'initial_reduction_ratio']) {
+    const measurement = reduced.valueReceipt.measurements.find(item => item.id === id);
+    assert.equal(measurement.operator_display, false);
+    assert.match(measurement.limitations.at(-1), /not model delivery/);
+  }
+  assert.match(reduced.summary, /1 passed/);
+});
+
+test('Task 16 reporter evidence stays below the ceiling and separates delivery boundaries', (t) => {
+  const logsDir = mkdtempSync(resolve(tmpdir(), 'opsle-task-16-evidence-'));
+  t.after(() => rmSync(logsDir, { recursive: true, force: true }));
+  const stdout = [
+    '> opsle-tasks@0.1.0 test',
+    '> NODE_ENV=test node --test test/*.test.js --test-reporter=dot',
+    '',
+    ...Array.from({ length: 112 }, (_, index) =>
+      `✔ task-${index + 1}-${'repetitive-success-detail-'.repeat(3)} (1.25ms)`),
+    ...Array.from({ length: 3 }, (_, index) => `﹣ external-${index + 1} (0.1ms) # SKIP`),
+    "Switched to a new branch 'feature'",
+    'ℹ tests 115', 'ℹ suites 0', 'ℹ pass 112', 'ℹ fail 0',
+    'ℹ cancelled 0', 'ℹ skipped 3', 'ℹ todo 0', 'ℹ duration_ms 12000',
+    '',
+  ].join('\n');
+  const run = {
+    code: 0, durationMs: 12_000, interrupted: false, stdout, stderr: '',
+    stdoutPath: '/retained/task-16.stdout', stderrPath: '/retained/task-16.stderr',
+  };
+  const manifest = {
+    id: 'opsle.context-firewall', name: 'Context Firewall', version: '0.5.0',
+    hooks: [{ name: 'command.evidence', outputSchema: 'opsle.execution.command-evidence.v1' }],
+  };
+  const capability = createContextFirewallCapability({
+    manifest,
+    configuration: { repository: config.contextFirewallRepo, maxBytes: 12_000 },
+    services: { logsDir, executionId: 'task-16-attempt-426' },
+  });
+  const result = capability.invoke('command.evidence', {
+    schema: 'opsle.execution.command-run.v1', taskId: 16, phase: 'TEST',
+    sourceId: 'opsle-tasks:tasks.full-verification', run,
+  });
+  const evidence = result.value;
+  const capabilityBytes = Buffer.byteLength(JSON.stringify(evidence), 'utf8');
+  const resultEnvelopeBytes = Buffer.byteLength(JSON.stringify(result), 'utf8');
+  assert.deepEqual(evidence.decisionEvidence.value.decision_evidence.counts,
+    { passed: 112, failed: 0, skipped: 3, total: 115 });
+  assert.equal('receipt' in evidence.decisionEvidence.value, false);
+  assert.equal(evidence.auditEvidence.value.protocol_version,
+    'opsle.context-firewall.evidence-packet/v1');
+  assert.equal(evidence.decisionEvidence.value.protocol_version,
+    'opsle.context-firewall.model-evidence/v1');
+  assert.equal(evidence.auditEvidence.metrics.originalBytes,
+    Buffer.byteLength(stdout, 'utf8'));
+  assert.ok(evidence.auditEvidence.metrics.reducedBytes <= 12_000);
+  assert.ok(evidence.auditEvidence.metrics.modelEvidenceBytes
+    < evidence.auditEvidence.metrics.reducedBytes);
+  assert.ok(capabilityBytes > evidence.auditEvidence.metrics.modelEvidenceBytes);
+  assert.ok(resultEnvelopeBytes > capabilityBytes);
+  t.diagnostic(JSON.stringify({
+    rawBytes: evidence.auditEvidence.metrics.originalBytes,
+    inputEnvelopeBytes: evidence.auditEvidence.metrics.inputEnvelopeBytes,
+    canonicalPacketBytes: evidence.auditEvidence.metrics.reducedBytes,
+    decisionEvidenceBytes: evidence.auditEvidence.metrics.decisionEvidenceBytes,
+    modelEvidenceBytes: evidence.auditEvidence.metrics.modelEvidenceBytes,
+    capabilityAdapterBytes: capabilityBytes,
+    capabilityResultEnvelopeBytes: resultEnvelopeBytes,
+  }));
+});
+
+test('Context Firewall evidence must match the exact invocation and projection shape', (t) => {
+  const directory = mkdtempSync(resolve(tmpdir(), 'opsle-context-scope-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const firewall = resolve(directory, 'firewall');
+  const logsDir = resolve(directory, 'logs');
+  mkdirSync(resolve(firewall, 'bin'), { recursive: true });
+  mkdirSync(logsDir);
+  const binary = resolve(firewall, 'bin', 'context-firewall.js');
+  const run = {
+    code: 1, durationMs: 12, interrupted: false,
+    stdout: 'not ok 1 - scoped\n', stderr: '',
+    stdoutPath: '/scoped/raw.stdout', stderrPath: '/scoped/raw.stderr',
+  };
+  writeFileSync(binary, `
+const fs = require('node:fs');
+let raw=''; process.stdin.on('data', chunk => raw += chunk); process.stdin.on('end', () => {
+  const input=JSON.parse(raw); const decision_evidence={status:'failed',process:input.process};
+  const packet={protocol_version:'opsle.context-firewall.evidence-packet/v1',operation_id:'wrong-operation',decision_evidence,receipt:{source:{id:input.source.id,run_id:input.source.run_id},raw_evidence:{reference:input.source.raw_evidence_ref}}};
+  const modelPath=process.argv[process.argv.indexOf('--model-evidence')+1];
+  fs.writeFileSync(modelPath,JSON.stringify({protocol_version:'opsle.context-firewall.model-evidence/v1',operation_id:packet.operation_id,decision_evidence})+'\\n');
+  process.stdout.write(JSON.stringify(packet)+'\\n');
+});
+`);
+  assert.throws(() => reduceWithContextFirewall({ ...config, contextFirewallRepo: firewall, logsDir }, {
+    taskId: 4, phase: 'TEST', sourceId: 'scoped-project', run, valueRunId: 'attempt-4',
+  }), /different command invocation/);
+
+  writeFileSync(binary, `
+const fs = require('node:fs');
+let raw=''; process.stdin.on('data', chunk => raw += chunk); process.stdin.on('end', () => {
+  const input=JSON.parse(raw); const decision_evidence={status:'failed',process:input.process};
+  const packet={protocol_version:'opsle.context-firewall.evidence-packet/v1',operation_id:input.operation_id,decision_evidence,receipt:{source:{id:input.source.id,run_id:input.source.run_id},raw_evidence:{reference:input.source.raw_evidence_ref}}};
+  const modelPath=process.argv[process.argv.indexOf('--model-evidence')+1];
+  fs.writeFileSync(modelPath,JSON.stringify({protocol_version:'opsle.context-firewall.model-evidence/v1',operation_id:packet.operation_id,decision_evidence,audit_metadata:'must not be submitted'})+'\\n');
+  process.stdout.write(JSON.stringify(packet)+'\\n');
+});
+`);
+  assert.throws(() => reduceWithContextFirewall({ ...config, contextFirewallRepo: firewall, logsDir }, {
+    taskId: 4, phase: 'TEST', sourceId: 'scoped-project', run, valueRunId: 'attempt-4',
+  }), /inconsistent model evidence/);
+});

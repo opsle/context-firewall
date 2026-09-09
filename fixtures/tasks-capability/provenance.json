@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/opsle/tasks",
+  "revision": "50f2666b2ddf3b95fc77c7e7bd8d64b6807e91f8",
+  "contextFirewallRevision": "6dd6e5fdf21f28dc5ebfa07954aaa9bed2dbcc32",
+  "sha256": {
+    "docs/CAPABILITIES.md": "4ec07ae1684c5104da077df0a8e7f32528636f63f0a8e31f85e14cf77124de90",
+    "src/capabilities.js": "14c04ff3b711003ae1ee448707b9fb1c4e57cd4593f0a1ee539029425c1dd282",
+    "src/capability-utils.js": "05d309d73f3c57d94c33552c0d7695e83761e2810939ecba92a34c8a05ef092b",
+    "capabilities/context-firewall/adapter.js": "70e6ae40c0e4fb3c95249ecc81d7325c5419349a9564d0704180a79258f76259",
+    "capabilities/context-firewall/opsle-capability.json": "e775af5309295e65c0dac3bc6ba7e53b565d648a13396fa9f1d4c827653d5466",
+    "src/adapters/context-firewall.js": "4a4a662a3e02a9b267fddf20a56b34e9bf55e132fa7b4761a9db1ab7d3774118",
+    "test/capabilities.test.js": "d70f352d397a1896b35b366b480543584ae7d48b801f02c6242a450dcd820ec4",
+    "test/adapters.test.js": "c540f8fa7b453627346da04af89a4f0f2c96fa76a0f65f25d98d385aabd33263",
+    "test/context-firewall-boundaries.test.js": "dc9f2edad420e5b3483c56cc3e1e391f195cbe4478bdd3b055c3d2d7310b71f5",
+    "test/context-firewall-repair.test.js": "e5625afa705d4f2a4a778ca8052ad8c2795f09d7ca91d09a9512dc3b9d6fc303",
+    "test/visible-value.test.js": "669ebd6af096fc8c978cd09e2f7a7f8f38dbacea03df4f4639e79745f30df116",
+    "LICENSE": "1cbaf5612596f0c221fb9c6e5fa49b517a6fc6ea2cbe1ae07138479accbf8c4d"
+  }
+}

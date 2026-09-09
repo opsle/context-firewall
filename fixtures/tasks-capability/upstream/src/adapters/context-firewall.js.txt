@@ -1,0 +1,135 @@
+import { spawnSync } from 'node:child_process';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { sourceRevision } from '../capability-utils.js';
+
+const INPUT_PROTOCOL = 'opsle.context-firewall.test-run-input/v1';
+const PACKET_PROTOCOL = 'opsle.context-firewall.evidence-packet/v1';
+const MODEL_EVIDENCE_PROTOCOL = 'opsle.context-firewall.model-evidence/v1';
+const TASKS_DELIVERY = Object.freeze({
+  schema: 'opsle.tasks.context-firewall-delivery.v2',
+  command_output: 'stored',
+  canonical_packet: 'stored',
+  model_evidence: 'constructed',
+  submission: 'recorded_by_separate_delivery_receipt_when_repair_runs',
+});
+const LEGACY_PACKET_DISPLAY_METRICS = new Set([
+  'initial_model_visible_bytes',
+  'bytes_initially_avoided',
+  'initial_reduction_ratio',
+]);
+
+const hasExactKeys = (value, keys) => value && typeof value === 'object'
+  && !Array.isArray(value)
+  && Object.keys(value).sort().join('\0') === [...keys].sort().join('\0');
+
+function evidenceSummary(packet, label) {
+  const evidence = packet.decision_evidence;
+  const counts = evidence.counts;
+  const lines = [`${label}: ${evidence.status}${counts ? ` (${counts.passed} passed, ${counts.failed} failed, ${counts.skipped} skipped)` : ''}.`];
+  for (const failure of evidence.failures || []) lines.push(`Failed: ${failure.identity}`);
+  for (const fatal of evidence.fatal_errors || []) lines.push(`Fatal: ${fatal.text || fatal.identity || 'runner error'}`);
+  for (const warning of evidence.warnings || []) lines.push(`Warning: ${warning.text || warning.identity || 'warning'}`);
+  if (evidence.disposition === 'NEEDS_RAW_EVIDENCE') lines.push('Context Firewall requires the retained raw evidence for a conclusive reading.');
+  return lines.join('\n');
+}
+
+export function reduceWithContextFirewall(config, {
+  taskId, phase, sourceId, run, maxBytes = 12_000, valueRunId = null,
+}) {
+  const operationId = `task-${taskId}-${phase.toLowerCase()}-${Date.now()}`;
+  const rawReference = `file:${run.stdoutPath};file:${run.stderrPath}`;
+  const processExitCode = Number.isInteger(run.code) && run.code >= 0 && run.code <= 255
+    ? run.code
+    : null;
+  const input = {
+    protocol_version: INPUT_PROTOCOL,
+    operation_id: operationId,
+    source: { id: sourceId, run_id: valueRunId || operationId, raw_evidence_ref: rawReference },
+    process: { exit_code: processExitCode, duration_ms: run.durationMs, interrupted: run.interrupted },
+    streams: [
+      { name: 'stdout', encoding: 'utf8', data: run.stdout },
+      { name: 'stderr', encoding: 'utf8', data: run.stderr },
+    ],
+  };
+  const binary = resolve(config.contextFirewallRepo, 'bin', 'context-firewall.js');
+  const receiptPath = resolve(config.logsDir, `${operationId}.value-receipt.json`);
+  const modelEvidencePath = resolve(config.logsDir, `${operationId}.model-evidence.json`);
+  const revision = sourceRevision(config.contextFirewallRepo);
+  const args = [binary, 'reduce', '--max-bytes', String(maxBytes), '--model-evidence', modelEvidencePath,
+    '--value-receipt', receiptPath];
+  if (revision) args.push('--mechanism-revision', revision);
+  const inputText = JSON.stringify(input);
+  const result = spawnSync(process.execPath, args, {
+    input: inputText, encoding: 'utf8', timeout: 10_000, maxBuffer: 2_000_000,
+  });
+  if (result.error) throw new Error(`Context Firewall is unavailable: ${result.error.message}`);
+  if (result.status !== 0) throw new Error(`Context Firewall rejected command evidence: ${result.stderr || 'unknown error'}`);
+  let packet;
+  try { packet = JSON.parse(result.stdout); } catch { throw new Error('Context Firewall returned invalid JSON.'); }
+  const expectedRunId = valueRunId || operationId;
+  if (packet.protocol_version !== PACKET_PROTOCOL
+    || packet.operation_id !== operationId
+    || packet.receipt?.source?.id !== sourceId
+    || packet.receipt?.source?.run_id !== expectedRunId
+    || packet.receipt?.raw_evidence?.reference !== rawReference
+    || packet.decision_evidence?.process?.exit_code !== processExitCode
+    || packet.decision_evidence?.process?.duration_ms !== run.durationMs
+    || packet.decision_evidence?.process?.interrupted !== run.interrupted) {
+    throw new Error('Context Firewall returned evidence for a different command invocation.');
+  }
+  const packetPath = resolve(config.logsDir, `${operationId}.context-firewall.json`);
+  const packetText = result.stdout;
+  writeFileSync(packetPath, packetText, { mode: 0o600 });
+  let modelEvidenceText; let modelEvidence;
+  try {
+    modelEvidenceText = readFileSync(modelEvidencePath, 'utf8');
+    modelEvidence = JSON.parse(modelEvidenceText);
+  } catch { throw new Error('Context Firewall model evidence is missing or invalid.'); }
+  if (!hasExactKeys(modelEvidence, ['protocol_version', 'operation_id', 'decision_evidence'])
+    || modelEvidence.protocol_version !== MODEL_EVIDENCE_PROTOCOL
+    || modelEvidence.operation_id !== packet.operation_id
+    || JSON.stringify(modelEvidence.decision_evidence) !== JSON.stringify(packet.decision_evidence)
+  ) {
+    throw new Error('Context Firewall returned inconsistent model evidence.');
+  }
+  let producerReceipt;
+  try { producerReceipt = JSON.parse(readFileSync(receiptPath, 'utf8')); }
+  catch { throw new Error('Visible Value failed: Context Firewall receipt is missing or invalid.'); }
+  const valueReceipt = {
+    ...producerReceipt,
+    measurements: Array.isArray(producerReceipt.measurements)
+      ? producerReceipt.measurements.map(measurement =>
+      LEGACY_PACKET_DISPLAY_METRICS.has(measurement.id) ? {
+        ...measurement,
+        operator_display: false,
+        limitations: [
+          ...(measurement.limitations || []),
+          'Opsle Tasks stores the canonical packet as audit evidence; this legacy packet metric is not model delivery.',
+        ],
+      } : measurement)
+      : producerReceipt.measurements,
+    extensions: {
+      ...(producerReceipt.extensions || {}),
+      opsle_tasks_delivery: {
+        ...TASKS_DELIVERY,
+        canonical_packet_bytes: Buffer.byteLength(packetText, 'utf8'),
+        model_evidence_bytes: Buffer.byteLength(modelEvidenceText, 'utf8'),
+      },
+    },
+  };
+  return {
+    packet,
+    packetPath,
+    packetText,
+    modelEvidence,
+    modelEvidencePath,
+    modelEvidenceText,
+    valueReceipt,
+    valueRunId,
+    receiptPath,
+    run,
+    inputEnvelopeBytes: Buffer.byteLength(inputText, 'utf8'),
+    summary: evidenceSummary(packet, phase),
+  };
+}
