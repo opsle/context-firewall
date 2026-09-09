@@ -7,7 +7,7 @@
     "context-firewall": "./bin/context-firewall.js"
   },
   "scripts": {
-    "check": "node --check ./src/reducer.js && node --check ./src/value-receipt.js && node --check ./bin/context-firewall.js && node --check ./fixtures/corpus.js && node --check ./tests/reducer.test.js",
+    "check": "node --check ./src/reducer.js && node --check ./src/value-receipt.js && node --check ./bin/context-firewall.js && node --check ./fixtures/corpus.js && node --check ./tests/reducer.test.js && node --check ./capabilities/tasks/adapter.js && node --check ./capabilities/tasks/reduce.js && node --check ./capabilities/tasks/utils.js && node --check ./tests/tasks-capability.test.js && node --check ./fixtures/tasks-capability/harness.mjs",
     "test": "node --test",
     "conformance": "node ./bin/context-firewall.js conformance"
   },

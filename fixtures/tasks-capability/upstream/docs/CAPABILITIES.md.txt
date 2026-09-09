@@ -1,0 +1,267 @@
+# Opsle capability contract v1
+
+Opsle Tasks owns task lifecycle and calls stable lifecycle hooks. It does not
+import or enumerate Opsle tools. A trusted, installed capability advertises the
+hooks it implements in `opsle-capability.json`; a repository selects capabilities
+in `.opsle/capabilities.json`.
+
+This is a protocol and a loader, not a daemon or package ecosystem.
+
+## Discovery and trust
+
+Tasks scans each root in `OPSLE_CAPABILITY_PATH` (platform path delimiter
+separated). Without that setting it scans the source `capabilities/` directory
+and the operator-managed `data/capabilities/` drop-in directory. A root may be a
+manifest, a capability directory, or a directory whose immediate children each
+contain `opsle-capability.json`. Discovery is deliberately not recursive.
+
+Manifests are bounded to 128 KB. The adapter must be a real file below the
+manifest directory, duplicate capability IDs stop startup/execution, and the
+manifest and adapter SHA-256 identities are captured at discovery and checked
+again before import and every invocation. The adapter identity is recorded with
+capability activity. These hashes detect mutation after discovery; they do not
+prove who supplied the bytes. Capability roots and installation provenance are
+operator trust decisions. Installing an adapter is a trusted-code operation: it
+runs with the Tasks process's authority. Repository configuration can select and
+configure granted adapters; it cannot supply executable paths.
+
+Discovery roots belong to the Tasks process and are not injected into project
+commands. Only environment bindings declared by capabilities selected for that
+execution are forwarded. This keeps a Tasks worktree's own test run from loading
+adapter source out of the canonical checkout.
+
+An upgrade replaces a capability-owned manifest/adapter and normally requires a
+Tasks process restart so the JavaScript module cache cannot retain old code. It
+does not require a Tasks source or package-lock change.
+
+## Manifest
+
+The v1 manifest contains only execution-contract information:
+
+```json
+{
+  "schema": "opsle.capability-manifest.v1",
+  "id": "opsle.example",
+  "name": "Example",
+  "version": "1.2.0",
+  "adapter": "adapter.js",
+  "default_enabled": false,
+  "configuration_schema": "opsle.example.tasks-config.v1",
+  "configuration": {
+    "repository": {
+      "type": "path",
+      "environment": "OPSLE_EXAMPLE_REPO",
+      "required": true
+    },
+    "mode": {
+      "type": "string",
+      "default": "bounded",
+      "project_configurable": true
+    }
+  },
+  "requires": [],
+  "hooks": [
+    {
+      "name": "command.evidence",
+      "input_schema": "opsle.execution.command-run.v1",
+      "output_schema": "opsle.execution.command-evidence.v1",
+      "role": "observer",
+      "execution": "deterministic",
+      "failure": "advisory",
+      "after": [],
+      "before": []
+    }
+  ]
+}
+```
+
+- `schema` versions the manifest protocol. Unknown schemas and fields fail
+  before the capability runs.
+- `id` is the stable capability identity; `version` is its SemVer implementation
+  version. The activity record also identifies the exact adapter bytes.
+- `adapter` is a capability-owned ESM module exporting `createCapability()`.
+- `configuration` describes typed values (`string`, `path`, `integer`, or
+  `boolean`) and optional environment bindings. `configuration_schema` versions
+  capability-specific configuration without teaching Tasks its meaning. Values
+  are operator-controlled unless explicitly marked `project_configurable`;
+  executable paths can never be project-controlled.
+- `requires` names genuine whole-capability dependencies. Missing enabled
+  dependencies fail closed.
+- Each hook declares exact input/output schema identities, whether it is an
+  `authority` or `observer`, whether its work is `deterministic` or
+  `model-backed`, and whether failure is `required` or `advisory`.
+- `before` and `after` apply only within the named hook. Absent peers create no
+  edge; cycles fail before invocation. IDs provide the stable tie-break order.
+
+Only one enabled authority may answer an authority hook. Any number of observers
+may run. A capability implements only hooks that fit its ownership; sharing the
+loader does not force tools through identical lifecycle stages.
+The `route.select` authority is required to be deterministic so intelligence
+cannot be used to authorize itself.
+
+The adapter returns `opsle.capability-result.v1` with its capability ID, hook,
+declared output schema, `ok` or `skipped` status, an optional authority value,
+optional operator events, evidence receipts, and private-log artifacts. A
+model-backed hook may first return the constrained `needs-intelligence` status
+described below; deterministic hooks cannot. The
+substrate routes receipts to all enabled `evidence.receipt` observers. It never
+names a receipt consumer. Artifact paths must resolve to bounded regular files
+directly inside the configured private logs directory; the substrate records
+their byte length and SHA-256 identity in a generic `CAPABILITY_ARTIFACT` event.
+
+## Current lifecycle hooks
+
+| Hook | Purpose |
+| --- | --- |
+| `execution.started` | Observe the task-scoped execution after discovery/selection |
+| `context.provide` | Supply bounded, untrusted task context before PLAN or BUILD |
+| `route.select` | Select the applicable execution route; exactly one authority |
+| `provider.completed` | Observe a completed provider result and its private trace path |
+| `verification.plan` | Select or broaden verification from the accepted change |
+| `command.evidence` | Convert an exact command result into decision and audit evidence |
+| `verification.capture` | Re-capture the accepted change before merge/deploy |
+| `evidence.receipt` | Observe a produced evidence receipt |
+| `execution.summary` | Add an optional post-execution summary fragment |
+| `execution.completed` | Observe the accepted revision/tree before final summary |
+
+Dispatch is generic by hook name: the runtime filters discovered declarations,
+topologically orders them, and invokes them without branching on capability ID.
+Installing a tool that fits an existing hook requires no runner or runtime
+change. A genuinely new lifecycle semantic may require a versioned substrate
+protocol revision and a new dispatch point; that is lifecycle evolution, not a
+reason to edit the central path for each tool.
+
+The v1 authority values used by Tasks are deliberately narrow:
+
+- `route.select` receives `opsle.execution.route-request.v1` with `phase`, the
+  user's `choice`, and an availability map. It returns
+  `opsle.execution.route-decision.v1` with the same `phase`, a route identifier,
+  and a non-empty reason. Provider-specific command construction is not part of
+  this contract.
+- `context.provide` receives `opsle.execution.context-request.v1` for PLAN or
+  BUILD and may return `opsle.execution.context-fragment.v1`. Tasks labels all
+  fragments as untrusted evidence, escapes tag openers, and enforces a 12 KB
+  aggregate ceiling before adding them to a provider prompt.
+- `verification.plan` receives `opsle.execution.verification-request.v1` with
+  the task, attempt/execution identities, and generation. It returns
+  `opsle.execution.verification-analysis.v1`: exact change identity, a complete
+  selected/skipped verification decision or an error, and the private evidence
+  record/path. Tasks remains the lifecycle orchestrator and executes only the
+  returned immutable catalog commands.
+- `command.evidence` receives `opsle.execution.command-run.v1` with task/phase
+  identity and the exact command result. It returns
+  `opsle.execution.command-evidence.v1` with the run, bounded decision evidence,
+  private audit evidence, their paths, and exact byte metrics.
+- `verification.capture` receives
+  `opsle.execution.change-capture-request.v1` and returns
+  `opsle.execution.change-set.v1` with repository/base/target/diff identities
+  and changed paths.
+- `evidence.receipt` receives `opsle.execution.receipt-notification.v1`; an
+  observer may acknowledge it and emit a report artifact.
+- `execution.summary` receives `opsle.execution.summary-request.v1`; an observer
+  may return `opsle.execution.summary-fragment.v1` containing bounded text.
+- `execution.started`, `provider.completed`, and `execution.completed` are
+  observer hooks with their matching `opsle.execution.*.v1` input and
+  `opsle.capability.ack.v1` output. A trajectory profiler or edit-policy observer
+  can record task-scoped evidence without taking over routing or verification.
+
+The result envelope's `output_schema` and every non-null authority/observer
+value's `schema` must exactly match the manifest declaration. An implementation
+that changes these shapes must publish a new contract schema rather than hiding
+an incompatible change behind its implementation version.
+
+## Repository selection
+
+Selection is read from the task's immutable base commit so a BUILD cannot change
+its selection while it runs:
+
+```json
+{
+  "schema": "opsle.capability-selection.v1",
+  "enable": ["opsle.example"],
+  "disable": ["opsle.visible-value"],
+  "configuration": {
+    "opsle.example": {
+      "schema": "opsle.example.tasks-config.v1",
+      "mode": "focused"
+    }
+  }
+}
+```
+
+Selection operates inside a separate operator-owned project grant. The existing
+Tasks project record stores this versioned policy:
+
+```json
+{
+  "schema": "opsle.capability-grants.v1",
+  "allow": ["opsle.example"]
+}
+```
+
+The authenticated/operator project API writes this record; repository Git
+content cannot. A trusted manifest with `default_enabled: true` is an explicit
+operator-installed global grant and default enablement. A capability with
+`default_enabled: false` must appear in the project's grant before repository
+selection can enable or configure it. A granted capability that declares an
+authority hook is activated by operator policy itself; repository selection may
+neither enable nor disable authorities. Unknown, extra, contradictory,
+ungranted, and protected selection fields fail closed.
+
+Repository selection controls only enable, disable, and manifest-declared scalar
+settings marked `project_configurable`. It cannot change hooks, roles, execution
+classification, failure policy, ordering, dependencies, adapter paths, schemas,
+or model scope. Disabling an observer removes its work. Disabling a required
+authority makes that lifecycle stage fail explicitly rather than silently
+selecting a fallback. Project grants are execution policy and cannot change while
+the project has an active task.
+
+## Model-backed capabilities
+
+`execution: model-backed` is a trusted classification, not an authorization and
+not a provider name. Every adapter initially receives a model service that only
+denies access. A model-backed hook may instead return `needs-intelligence` with a
+bounded, provider-neutral `opsle.model-request.v1` containing only `phase`,
+`purpose`, and `prompt`. The substrate then invokes the ordinary `route.select`
+authority with intelligence disabled during that routing call.
+
+Only a model route returned by that authority lets the substrate mint an opaque,
+30-second, single-use `opsle.model-authorization.v1`. It binds the execution ID,
+capability ID, hook, exact request hash, and selected provider. The adapter is
+invoked again with a closure bound to that authorization. The gateway rejects a
+missing, forged, expired, reused, cross-execution, cross-capability, cross-hook,
+or request-widened authorization. It consumes the grant before provider
+submission, so a failed call cannot become an implicit retry. The capability
+invocation closes an unused grant when the hook returns. The capability API
+exposes neither provider executors, provider binary configuration, nor the raw
+substrate configuration. Capability-specific resolved configuration, bounded
+execution metadata, private-log location, and read-only provider metadata are
+passed separately.
+
+This keeps provider details in the gateway and makes Gearbox unavoidable within
+the capability protocol without turning it into a broker. As with every ESM
+adapter, the operator-installed adapter is trusted code running in the Tasks
+process. The loader is not a sandbox for hostile installed JavaScript; preventing
+such code from importing Node process APIs is an installation provenance and OS
+isolation responsibility, not something SHA-256 or the capability contract can
+establish. Repository-controlled content receives no path to install or alter
+that code.
+
+## Add, disable, upgrade, and remove
+
+To add a tool, install one directory containing its manifest and adapter in a
+trusted discovery root, grant its ID in the operator-owned project policy, then
+enable its ID in repository selection where it is not an authority. Granted
+authorities are operator-enabled directly. To disable an observer, add its ID to
+`disable` or remove the project grant; disabling an authority requires the
+operator to remove its grant or installed global default. To upgrade it
+compatibly, replace that capability-owned
+directory and restart Tasks. To remove it, disable/revoke it and remove its
+directory. None of these operations changes `runner.js`, the capability runtime,
+Gearbox, provider integrations, other capabilities, or the Tasks package
+manifest.
+
+The compatibility adapters currently bundled for Gearbox, Context Firewall,
+Affected Verification, and Visible Value call those independently installed
+projects through their public interfaces. They are examples, not a registry
+hard-coded into the loader.

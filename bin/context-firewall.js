@@ -72,12 +72,13 @@ async function main() {
     mechanismRevision: options.mechanismRevision,
   });
   if (options.valueReceiptPath) {
-    await writeFile(options.valueReceiptPath, `${canonicalJson(valueReceipt)}\n`, 'utf8');
+    await writeFile(options.valueReceiptPath, `${canonicalJson(valueReceipt)}\n`, { encoding: 'utf8', mode: 0o600 });
   }
   if (options.modelEvidencePath) {
     await writeFile(
       options.modelEvidencePath,
       serializeModelEvidence(modelEvidenceForPacket(packet)),
+      { mode: 0o600 },
     );
   }
   process.stdout.write(serializePacket(packet));

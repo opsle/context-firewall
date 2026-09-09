@@ -1,0 +1,64 @@
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { reduceWithContextFirewall } from './reduce.js';
+import { capabilityResult } from './utils.js';
+
+export function createCapability({ manifest, configuration, services }) {
+  return {
+    health() {
+      return {
+        available: existsSync(resolve(configuration.repository, 'bin', 'context-firewall.js')),
+        detail: `CLI not found under ${configuration.repository}`,
+      };
+    },
+    invoke(hook, payload) {
+      const evidence = reduceWithContextFirewall({
+        contextFirewallRepo: configuration.repository,
+        logsDir: services.logsDir,
+      }, {
+        ...payload,
+        valueRunId: services.executionId,
+        maxBytes: configuration.maxBytes,
+      });
+      const measurements = evidence.packet?.receipt?.measurements;
+      if (!Number.isSafeInteger(measurements?.original_bytes)
+        || !Number.isSafeInteger(measurements?.reduced_bytes)) {
+        throw new Error(`${manifest.name} returned invalid evidence measurements.`);
+      }
+      const normalized = {
+        schema: 'opsle.execution.command-evidence.v1',
+        operationId: evidence.packet.operation_id,
+        executionId: services.executionId,
+        summary: evidence.summary,
+        run: evidence.run,
+        decisionEvidence: {
+          value: evidence.modelEvidence,
+          text: evidence.modelEvidenceText,
+          path: evidence.modelEvidencePath,
+        },
+        auditEvidence: {
+          value: evidence.packet,
+          text: evidence.packetText,
+          path: evidence.packetPath,
+          inputHash: evidence.packet.receipt.input_hash,
+          metrics: {
+            originalBytes: measurements.original_bytes,
+            inputEnvelopeBytes: evidence.inputEnvelopeBytes,
+            reducedBytes: measurements.reduced_bytes,
+            decisionEvidenceBytes: Buffer.byteLength(
+              `${JSON.stringify(evidence.packet.decision_evidence)}\n`, 'utf8'),
+            modelEvidenceBytes: Buffer.byteLength(evidence.modelEvidenceText, 'utf8'),
+          },
+        },
+      };
+      return capabilityResult(manifest, hook, {
+        value: normalized,
+        receipts: [evidence.valueReceipt],
+        events: [{
+          kind: 'EVIDENCE',
+          message: `${manifest.name}${payload.rerun ? ' rerun' : ''} packet: ${evidence.packetPath}`,
+        }],
+      });
+    },
+  };
+}

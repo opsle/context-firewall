@@ -1,0 +1,17 @@
+{
+  "name": "@opsle/context-firewall-tasks-capability",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "adapter.js",
+    "reduce.js",
+    "utils.js",
+    "opsle-capability.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  }
+}

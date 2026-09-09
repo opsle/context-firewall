@@ -1,0 +1,89 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { resolve } from 'node:path';
+import { createCapability as createVisibleValue } from '../capabilities/visible-value/adapter.js';
+import { discoverCapabilities } from '../src/capabilities.js';
+import { reduceWithContextFirewall } from '../src/adapters/context-firewall.js';
+import { openDatabase } from '../src/db.js';
+import { createRunner } from '../src/runner.js';
+
+const root = resolve(new URL('..', import.meta.url).pathname);
+const components = {
+  pythonBin: 'python3',
+  gearboxRepo: process.env.OPSLE_GEARBOX_REPO || resolve(root, '..', 'gearbox'),
+  contextFirewallRepo: process.env.OPSLE_CONTEXT_FIREWALL_REPO || resolve(root, '..', 'context-firewall'),
+  visibleValueRepo: process.env.OPSLE_VISIBLE_VALUE_REPO || resolve(root, '..', 'visible-value'),
+};
+function temporary(t) {
+  const dir = mkdtempSync(resolve(tmpdir(), 'opsle-visible-value-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true })); return dir;
+}
+
+test('real mechanism receipts reach the independently installed public summarizer', async t => {
+  const dir = temporary(t); const events = [];
+  const config = { ...components, logsDir: dir, databasePath: resolve(dir, 'tasks.sqlite') };
+  const executionId = 'fixture-task-1-attempt-1';
+  const manifest = discoverCapabilities({ root }).find(item => item.id === 'opsle.visible-value');
+  const value = await createVisibleValue({
+    manifest,
+    configuration: { repository: components.visibleValueRepo },
+    services: { logsDir: config.logsDir, executionId },
+  });
+  assert.equal(value.health().available, true);
+  const result = reduceWithContextFirewall(config, { taskId: 1, phase: 'TEST', sourceId: 'fixture', valueRunId: executionId,
+    run: { code: 0, durationMs: 1, interrupted: false, stdout: 'TAP version 13\nok 1 - proof\n1..1\n# tests 1\n# pass 1\n# fail 0\n', stderr: '', stdoutPath: '/fixture/stdout', stderrPath: '/fixture/stderr' } });
+  const observed = value.invoke('evidence.receipt', {
+    schema: 'opsle.execution.receipt-notification.v1', receipt: result.valueReceipt,
+  });
+  events.push(...observed.events);
+  const reportPath = resolve(dir, `${executionId}.visible-value.json`);
+  const report = JSON.parse(readFileSync(reportPath));
+  assert.equal(report.tool.name, '@opsle/visible-value');
+  assert.equal(report.receipts.length, 1);
+  assert.equal(report.rows.some(r => r.measurement.id === 'initial_model_visible_bytes'), false);
+  assert.ok(report.receipts[0].extensions.opsle_tasks_delivery.model_evidence_bytes > 0);
+  assert.equal(events.length, 1);
+  const summary = value.invoke('execution.summary', {
+    schema: 'opsle.execution.summary-request.v1',
+  }).value.text;
+  assert.match(summary, /Opsle Value/);
+  assert.doesNotMatch(summary, /initial_model_visible_bytes/);
+  const before = readFileSync(reportPath, 'utf8');
+  const invalid = structuredClone(result.valueReceipt);
+  invalid.measurements[0].source_verification = 'UNVERIFIED';
+  assert.throws(() => value.invoke('evidence.receipt', {
+    schema: 'opsle.execution.receipt-notification.v1', receipt: invalid,
+  }), /EXACT requires verified evidence/);
+  assert.equal(events.length, 1); assert.equal(readFileSync(reportPath, 'utf8'), before);
+});
+
+test('unusable receipt fails the actual runner and releases its project lock', { timeout: 20_000 }, async t => {
+  const dir = temporary(t); const repo = resolve(dir, 'project');
+  mkdirSync(repo); mkdirSync(resolve(dir, 'logs')); mkdirSync(resolve(dir, 'worktrees'));
+  const git = args => execFileSync('git', args, { cwd: repo, stdio: 'pipe' });
+  git(['init', '-b', 'main']); writeFileSync(resolve(repo, 'README.md'), '# failure fixture\n');
+  git(['add', '.']); git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'fixture']);
+  const provider = resolve(dir, 'provider');
+  writeFileSync(provider, `#!${process.execPath}\nconst fs = require('fs');\nconst args = process.argv;\nif (args.includes('--version')) process.exit(0);\nconst plan = args.at(-1).startsWith('Plan one');\nfs.writeFileSync(args[args.indexOf('--output-last-message')+1], JSON.stringify(plan ? {status:'ready',plan:'Do nothing; test reporting failure.'} : {status:'completed',summary:'No change needed.'}));\n`, { mode: 0o700 });
+  const firewall = resolve(dir, 'firewall'); mkdirSync(firewall); mkdirSync(resolve(firewall, 'bin'));
+  writeFileSync(resolve(firewall, 'bin/context-firewall.js'), `const fs = require('fs');\nlet raw=''; process.stdin.on('data', chunk => raw += chunk); process.stdin.on('end', () => {\nconst input=JSON.parse(raw); const decision_evidence={status:'passed',failures:[],fatal_errors:[],warnings:[],process:input.process};\nconst packet={protocol_version:'opsle.context-firewall.evidence-packet/v1',operation_id:input.operation_id,decision_evidence,receipt:{source:{id:input.source.id,run_id:input.source.run_id},raw_evidence:{reference:input.source.raw_evidence_ref}}};\nfs.writeFileSync(process.argv[process.argv.indexOf('--model-evidence')+1], JSON.stringify({protocol_version:'opsle.context-firewall.model-evidence/v1',operation_id:input.operation_id,decision_evidence})+'\\n');\nfs.writeFileSync(process.argv[process.argv.indexOf('--value-receipt')+1], '{}');\nconsole.log(JSON.stringify(packet)+'\\n');\n});\n`);
+  const config = { ...components, databasePath: resolve(dir, 'tasks.sqlite'), logsDir: resolve(dir, 'logs'), worktreesDir: resolve(dir, 'worktrees'),
+    codexBin: provider, claudeBin: '/missing', contextFirewallRepo: firewall, commandTimeoutSeconds: 5, worktreeHours: 48 };
+  const store = openDatabase(config.databasePath); t.after(() => store.close());
+  const project = store.addRepository({ name: 'failure fixture', path: repo, defaultBranch: 'main', testCommand: 'true', deployCommand: '', enabled: true });
+  const task = store.createTask({ repoId: project.id, title: 'Failure fixture', description: '', providerChoice: 'codex', dispatchMode: 'NOW' });
+  const failure = new Promise(resolveFailure => {
+    const fail = store.failTask.bind(store);
+    store.failTask = (id, message) => { fail(id, message); resolveFailure(message); };
+    store.finishTask = () => { throw new Error('Unexpected successful completion'); };
+  });
+  const runner = createRunner({ store, config }); t.after(() => runner.stop()); runner.tick();
+  assert.match(await failure, /Context Firewall returned invalid evidence measurements/);
+  assert.equal(store.getTask(task.id).status, 'FAILED');
+  const second = store.createTask({ repoId: project.id, title: 'Lock release proof', description: '', providerChoice: 'codex', dispatchMode: 'NOW' });
+  assert.ok(store.claimableTasks().includes(second.id));
+  assert.equal(store.taskDetails(task.id).events.filter(e => e.kind === 'DONE').length, 0);
+});
