@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Canonical TEST stage for opsle/context-firewall. GitHub Actions and agents run this same command.
+#   ops/ci/test
+set -Eeuo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+
+step() { printf '\n==> %s\n' "$*"; }
+
+step "Check source syntax"
+npm run check
+
+step "Run test suite"
+npm test
+
+step "Run conformance validation"
+npm run conformance
